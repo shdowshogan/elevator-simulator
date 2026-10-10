@@ -6,6 +6,8 @@
 //                               call appears and again every few seconds while it is still waiting)
 //   assignPassenger(req, world) which car should this person take?        (optional, destination keypads)
 //   park(car, world)            where should an idle car wait?            (optional)
+//   chooseLobby(req, world)     which lift lobby should this person walk to? (optional; only in
+//                               buildings with several lobbies when people follow guidance)
 // Everything in `world` is a read-only snapshot. Use `world.state` to remember things between calls.
 
 export const UP = 1;
@@ -28,9 +30,21 @@ export interface PassengerRequest {
   direction: Direction;
   age: number; // seconds waited so far
   assignedCar: number | null;
+  lobby: number; // the lift lobby they are standing in
+}
+
+/** Someone about to set off, in a building with several lift lobbies. */
+export interface LobbyRequest {
+  floor: number;
+  dest: number;
+  direction: Direction;
+  /** Seconds of walking if they use each lobby (both ends of the trip). Infinity = no car there can take them. */
+  walk: number[];
+  nearest: number; // the lobby they would pick on their own
 }
 
 export interface HallCallView {
+  lobby: number; // which lift lobby the call is in (always 0 in a single-lobby building)
   floor: number;
   direction: Direction;
   age: number; // seconds since the longest-waiting person here pressed the button
@@ -45,6 +59,7 @@ export interface HallCallView {
 export interface CarView {
   id: number;
   name: string;
+  lobby: number; // the lift lobby this car stands in; cars only answer calls from their own lobby
   floor: number; // nearest floor
   position: number; // exact position in floors, e.g. 12.4
   velocity: number; // m/s, positive = up
@@ -79,6 +94,8 @@ export interface WorldView {
   mode: 'hall' | 'destination';
   cars: CarView[];
   calls: HallCallView[];
+  /** Lift lobbies: one in a tower, six in Hostel 18. */
+  lobbies: { id: number; name: string; cars: number[] }[];
   /** People per minute over the last five minutes. */
   traffic: { up: number; down: number; inter: number; total: number };
   params: Record<string, number>;
@@ -104,6 +121,7 @@ export interface ElevatorAlgorithm {
   assignCall?(call: HallCallView, world: WorldView): number | null | undefined | void;
   assignPassenger?(req: PassengerRequest, world: WorldView): number | null | undefined | void;
   park?(car: CarView, world: WorldView): number | null | undefined | void;
+  chooseLobby?(req: LobbyRequest, world: WorldView): number | null | undefined | void;
 }
 
 // ---------------------------------------------------------------- helpers

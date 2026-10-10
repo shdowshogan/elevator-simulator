@@ -2,14 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import { CompareTab } from './CompareTab';
 import { ConfigPanel } from './ConfigPanel';
 import { EditorTab } from './EditorTab';
+import { HostelPanel } from './HostelPanel';
 import { startRuntime } from './runtime';
 import { SandboxPanel } from './SandboxPanel';
 import { StatsPanel } from './StatsPanel';
-import { useStore, type Tab } from './store';
+import { isLive, useStore, type Tab } from './store';
 import { Transport } from './Transport';
 
 const TABS: { id: Tab; label: string; hint: string }[] = [
   { id: 'simulate', label: 'Simulate', hint: 'A full day of traffic in your buildings' },
+  { id: 'hostel', label: 'Hostel 18', hint: 'IIT Bombay Hostel 18: six lifts around two courtyards' },
   { id: 'sandbox', label: 'Sandbox', hint: 'Hand-build one exact situation' },
   { id: 'compare', label: 'Compare', hint: 'Benchmark algorithms and setups side by side' },
   { id: 'editor', label: 'Algorithm editor', hint: 'Write your own algorithm' },
@@ -19,6 +21,7 @@ export function App() {
   const viewport = useRef<HTMLDivElement>(null);
   const tab = useStore((s) => s.tab);
   const set = useStore((s) => s.set);
+  const setTab = useStore((s) => s.setTab);
   const [left, setLeft] = useState(true);
   const [right, setRight] = useState(true);
   const [webglError, setWebglError] = useState<string | null>(null);
@@ -44,7 +47,7 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [set]);
 
-  const live = tab === 'simulate' || tab === 'sandbox';
+  const live = isLive(tab);
 
   return (
     <div className={`app ${live ? '' : 'dimmed'}`}>
@@ -58,7 +61,7 @@ export function App() {
         </div>
         <nav>
           {TABS.map((t) => (
-            <button key={t.id} className={t.id === tab ? 'on' : ''} title={t.hint} onClick={() => set({ tab: t.id })}>
+            <button key={t.id} className={t.id === tab ? 'on' : ''} title={t.hint} onClick={() => setTab(t.id)}>
               {t.label}
             </button>
           ))}
@@ -73,7 +76,7 @@ export function App() {
         </div>
       </header>
 
-      {live && left && <aside className="panel left">{tab === 'sandbox' ? <SandboxPanel /> : <ConfigPanel />}</aside>}
+      {live && left && <aside className="panel left">{tab === 'sandbox' ? <SandboxPanel /> : tab === 'hostel' ? <HostelPanel /> : <ConfigPanel />}</aside>}
       {live && right && <aside className="panel right"><StatsPanel /></aside>}
       {live && <Transport />}
       {tab === 'compare' && <div className="overlay"><CompareTab /></div>}

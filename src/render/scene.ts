@@ -7,9 +7,10 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { BuildingSim, Car, Passenger, Simulation } from '../sim/engine';
+import { samplePath, type HostelPlan } from '../sim/hostel';
 import { CORE_PAD, CORRIDOR_D, ENTRANCE_Z, FLAT_D, FLAT_W, SHAFT_D, SHAFT_W, type Layout } from '../sim/layout';
 import { mulberry32 } from '../sim/rng';
-import { CAR_COLORS, carName, floorLabel } from '../sim/types';
+import { CAR_COLORS, floorLabel } from '../sim/types';
 
 export type Selection =
   | { type: 'passenger'; id: number }
@@ -79,7 +80,15 @@ interface BuildingVisual {
   lampState: Uint8Array;
   windows: THREE.InstancedMesh;
   windowSeed: Float32Array;
+  windowDay: THREE.Color; // colour of an unlit window in daylight
+  windowGain: number; // brightness of lit windows (big lit surfaces need less than small panes)
   highlight: THREE.Mesh;
+  hostel: HostelPlan | null; // set for the Hostel 18 floor plan
+  yScale: number; // vertical stretch of the drawing (the hostel can be pulled apart to see inside)
+  width: number; // footprint along x
+  height: number; // drawn height
+  zMin: number; // ground kept clear around the building, for the plaza and trees
+  zMax: number;
 }
 
 const smooth = (a: number, b: number, x: number) => {
@@ -110,6 +119,8 @@ export class SceneManager {
   onSelect: (s: Selection) => void = () => {};
   selection: Selection = null;
   showLabels = true;
+  /** How far apart the hostel's floors are drawn: 1 = true scale. */
+  hostelSpread = 1.7;
 
   private composer: EffectComposer;
   private bloom: UnrealBloomPass;
@@ -324,21 +335,20 @@ export class SceneManager {
 
   /** Rebuild all geometry for a new simulation. `keepCamera` avoids a jump on small edits. */
   build(sim: Simulation, keepCamera = false) {
-    const before = `${this.campus.width}|${this.campus.height}`;
     this.clearRoot();
     this.selection = null;
     this.windowStamp = -1;
 
-    const layouts = sim.buildings.map((b) => b.layout);
-    const total = layouts.reduce((a, l) => a + l.width, 0) + BUILDING_GAP * (layouts.length - 1);
+    const widths = sim.buildings.map((b) => (b.plan.kind === 'hostel18' ? (b.plan as HostelPlan).length : b.layout.width));
+    const total = widths.reduce((a, w) => a + w, 0) + BUILDING_GAP * (widths.length - 1);
     let x = -total / 2;
     let maxH = 0;
     sim.buildings.forEach((b, i) => {
-      const l = layouts[i];
-      const offsetX = x + l.width / 2;
-      x += l.width + BUILDING_GAP;
-      maxH = Math.max(maxH, l.height);
-      this.buildings.push(this.buildBuilding(b, offsetX));
+      const offsetX = x + widths[i] / 2;
+      x += widths[i] + BUILDING_GAP;
+      const bv = b.plan.kind === 'hostel18' ? this.buildHostel(b, offsetX) : this.buildBuilding(b, offsetX);
+      maxH = Math.max(maxH, bv.height);
+      this.buildings.push(bv);
     });
     this.campus = { width: total, height: maxH };
     this.buildGrounds(total, sim);
@@ -349,7 +359,7 @@ export class SceneManager {
     sc.near = 10; sc.far = reach * 5;
     sc.updateProjectionMatrix();
 
-    if (!keepCamera || before !== `${total}|${maxH}`) this.focus('overview', true);
+    if (!keepCamera) this.focus('overview', true);
   }
 
   private buildGrounds(total: number, sim: Simulation) {
@@ -359,9 +369,11 @@ export class SceneManager {
     ground.receiveShadow = true;
     this.root.add(ground);
 
+    const zMin = Math.min(...this.buildings.map((bv) => bv.zMin));
+    const zMax = Math.max(...this.buildings.map((bv) => bv.zMax));
     const plaza = new THREE.Mesh(this.box, this.mats.plaza);
-    plaza.scale.set(total + 30, 0.3, FLAT_D + ENTRANCE_Z + 18);
-    plaza.position.set(0, -0.16, (ENTRANCE_Z - FLAT_D) / 2 + 3);
+    plaza.scale.set(total + 30, 0.3, zMax - zMin);
+    plaza.position.set(0, -0.16, (zMax + zMin) / 2);
     plaza.receiveShadow = true;
     this.root.add(plaza);
 
@@ -371,10 +383,10 @@ export class SceneManager {
     const crowns: number[][] = [];
     // Keep the ground in front of each tower clear so nothing blocks the view into the corridors.
     const blocked = (tx: number, tz: number) =>
-      tz > -FLAT_D - 5 && tz < 64 && this.buildings.some((bv) => Math.abs(tx - bv.offsetX) < bv.layout.width / 2 + 5);
+      this.buildings.some((bv) => tz > bv.zMin + 1 && tz < bv.zMax + 46 && Math.abs(tx - bv.offsetX) < bv.width / 2 + 5);
     for (let i = 0; i < 400 && crowns.length < 70; i++) {
       const tx = (r() - 0.5) * (total + 190);
-      const tz = -FLAT_D - 42 + r() * 135;
+      const tz = zMin - 36 + r() * (zMax - zMin + 110);
       if (blocked(tx, tz)) continue;
       const s = 0.8 + r() * 0.9;
       trunks.add(tx, 1.1 * s, tz, 0.3 * s, 2.2 * s, 0.3 * s);
@@ -519,7 +531,10 @@ export class SceneManager {
     group.add(lamps);
 
     // elevator cars
-    const cars = b.cars.map((c) => this.buildCar(b, c, group, H));
+    const cars = b.cars.map((c) => {
+      const sx = l.shaftX(c.index);
+      return this.buildCar(c, group, sx, 0, 0, { x: sx, z: CAR_Z }, { x: sx, z: -SHAFT_D + 0.16, sx: 1.3, sz: 0.22 });
+    });
 
     const highlight = new THREE.Mesh(this.box, this.mats.highlight);
     highlight.scale.set(W, h - 0.3, CORRIDOR_D);
@@ -545,16 +560,36 @@ export class SceneManager {
       lampState: new Uint8Array(levels * 2),
       windows: windowMesh,
       windowSeed: Float32Array.from(seeds),
+      windowDay: new THREE.Color(0.3, 0.44, 0.6),
+      windowGain: 1,
       highlight,
+      hostel: null,
+      yScale: 1,
+      width: W,
+      height: H,
+      zMin: -FLAT_D - 6,
+      zMax: ENTRANCE_Z + 12,
     };
   }
 
-  private buildCar(b: BuildingSim, c: Car, parent: THREE.Group, H: number): CarVisual {
-    const l = b.layout;
+  /**
+   * One elevator car. The door faces local +z; otY turns the car to face its corridor.
+   * The cable and counterweight hang at fixed spots in the shaft.
+   */
+  private buildCar(
+    c: Car,
+    parent: THREE.Group,
+    x: number,
+    z: number,
+    rotY: number,
+    cableAt: { x: number; z: number },
+    weightAt: { x: number; z: number; sx: number; sz: number },
+  ): CarVisual {
     const color = new THREE.Color(CAR_COLORS[c.index % CAR_COLORS.length]);
     const accent = this.track(new THREE.MeshBasicMaterial({ color: color.clone().multiplyScalar(1.5) }));
     const group = new THREE.Group();
-    group.position.set(l.shaftX(c.index), 0, 0);
+    group.position.set(x, 0, z);
+    group.rotation.y = rotY;
     group.userData.car = c.index;
     const add = (mat: THREE.Material, x: number, y: number, z: number, sx: number, sy: number, sz: number) => {
       const m = new THREE.Mesh(this.box, mat);
@@ -576,11 +611,11 @@ export class SceneManager {
     parent.add(group);
 
     const cable = new THREE.Mesh(this.box, this.mats.cable);
-    cable.position.set(l.shaftX(c.index), 0, CAR_Z);
+    cable.position.set(cableAt.x, 0, cableAt.z);
     parent.add(cable);
     const weight = new THREE.Mesh(this.box, this.mats.weight);
-    weight.scale.set(1.3, 2.4, 0.22);
-    weight.position.set(l.shaftX(c.index), 0, -SHAFT_D + 0.16);
+    weight.scale.set(weightAt.sx, 2.4, weightAt.sz);
+    weight.position.set(weightAt.x, 0, weightAt.z);
     parent.add(weight);
 
     const label = document.createElement('div');
@@ -589,18 +624,302 @@ export class SceneManager {
     const labelObj = new CSS2DObject(label);
     labelObj.position.set(0, CAR_H + 1.0, CAR_Z + CAR_D / 2);
     group.add(labelObj);
-    void H;
     return { group, doorL, doorR, cable, weight, label, labelObj, text: '' };
+  }
+
+  /**
+   * Hostel 18, drawn as stacked open trays: every floor is a slab with its rooms cut off at
+   * waist height, so the corridors, the people in them and the six lift shafts stay visible.
+   */
+  private buildHostel(b: BuildingSim, offsetX: number): BuildingVisual {
+    const plan = b.plan as HostelPlan;
+    const yScale = this.hostelSpread;
+    const ys = b.h * yScale;
+    const levels = b.levels;
+    const height = (levels - 1) * ys + 3.4;
+    const ROOM_H = 1.15;
+    const group = new THREE.Group();
+    group.position.x = offsetX;
+    group.userData.building = b.index;
+    this.root.add(group);
+
+    const slabs = new Batch();
+    const floors = new Batch();
+    const rooms = new Batch();
+    const metal = new Batch();
+    const glass = new Batch();
+    const grass = new Batch();
+    const lights = new Batch();
+    const seeds: number[] = [];
+    const r = mulberry32(4321 + b.index * 31);
+
+    for (let f = 0; f < levels; f++) {
+      const y = f * ys;
+      for (const k of plan.blocks) slabs.add(k.x, y - 0.13, k.z, k.w, 0.26, k.d);
+      for (const k of plan.corridors) floors.add(k.x, y + 0.012, k.z, k.w, 0.024, k.d);
+      // columns carry the floor above
+      if (f < levels - 1) {
+        for (const k of plan.blocks) {
+          const alongX = k.w >= k.d;
+          const run = alongX ? k.w : k.d;
+          const count = Math.max(2, Math.round(run / 9.6));
+          for (let i = 0; i <= count; i++) {
+            const t = -run / 2 + 0.3 + ((run - 0.6) * i) / count;
+            for (const edge of [-1, 1]) {
+              const off = (edge * ((alongX ? k.d : k.w) - 0.5)) / 2;
+              metal.add(alongX ? k.x + t : k.x + off, y + (ys - 0.26) / 2, alongX ? k.z + off : k.z + t, 0.28, ys - 0.26, 0.28);
+            }
+          }
+        }
+      }
+      if (f === 0) continue; // ground floor: entrance hall and common rooms, left open
+      for (const room of plan.rooms) {
+        rooms.add(room.x, y + ROOM_H / 2, room.z, room.w - 0.14, ROOM_H, room.d - 0.14);
+        lights.add(room.x, y + ROOM_H + 0.03, room.z, room.w - 0.7, 0.05, room.d - 0.7);
+        seeds.push(r());
+      }
+    }
+    for (const k of plan.courtyards) grass.add(k.x, 0.04, k.z, k.w, 0.08, k.d);
+
+    // lift shafts: an open steel frame with glass on the three closed sides
+    const cars = b.cars.map((c) => {
+      const sh = plan.shafts[c.index];
+      const cx = sh.doorX + 0.15 + CAR_D / 2;
+      const hx = CAR_D / 2 + 0.22;
+      const hz = CAR_W / 2 + 0.18;
+      for (const dx of [-hx, hx]) for (const dz of [-hz, hz]) metal.add(cx + dx, height / 2, sh.doorZ + dz, 0.12, height, 0.12);
+      glass.add(cx + hx, height / 2, sh.doorZ, 0.04, height, hz * 2);
+      glass.add(cx, height / 2, sh.doorZ - hz, hx * 2, height, 0.04);
+      glass.add(cx, height / 2, sh.doorZ + hz, hx * 2, height, 0.04);
+      metal.add(cx, height + 0.2, sh.doorZ, hx * 2 + 0.3, 0.4, hz * 2 + 0.3);
+      return this.buildCar(c, group, sh.doorX, sh.doorZ, -Math.PI / 2, { x: sh.doorX - CAR_Z, z: sh.doorZ }, { x: cx + hx - 0.14, z: sh.doorZ, sx: 0.2, sz: 1.3 });
+    });
+
+    // front door canopy and the path out to the road
+    const out = plan.street.z > plan.entrance.z ? 1 : -1; // which way the front door faces
+    metal.add(plan.entrance.x, ys - 0.5, plan.entrance.z + out * 2, 7, 0.16, 4);
+    const path = new THREE.Mesh(this.box, this.mats.path);
+    const run = Math.abs(plan.street.z - plan.entrance.z) + 6;
+    path.scale.set(4.4, 0.06, run);
+    path.position.set(plan.entrance.x, 0.02, plan.entrance.z + (out * run) / 2);
+    path.receiveShadow = true;
+    group.add(path);
+
+    group.add(slabs.build(this.box, this.mats.slab, true));
+    group.add(floors.build(this.box, this.mats.path));
+    group.add(rooms.build(this.box, this.mats.front, true));
+    group.add(metal.build(this.box, this.mats.metal));
+    group.add(grass.build(this.box, this.mats.leaves));
+    const glassMesh = glass.build(this.box, this.mats.glass);
+    glassMesh.renderOrder = 2;
+    group.add(glassMesh);
+    const lightMesh = lights.build(this.box, this.mats.window);
+    for (let i = 0; i < lights.count; i++) lightMesh.setColorAt(i, _c.setRGB(0.6, 0.58, 0.54));
+    group.add(lightMesh);
+
+    // a few small trees in the courtyards
+    const crownGeo = this.track(new THREE.IcosahedronGeometry(1, 1));
+    const trunks = new Batch();
+    const crowns: number[][] = [];
+    for (const k of plan.courtyards) {
+      for (let i = 0; i < 5; i++) {
+        const tx = k.x + (r() - 0.5) * (k.w - 6);
+        const tz = k.z + (r() - 0.5) * (k.d - 6);
+        const s = 0.55 + r() * 0.4;
+        trunks.add(tx, s, tz, 0.22, 2 * s, 0.22);
+        crowns.push([tx, 2.9 * s, tz, 1.8 * s]);
+      }
+    }
+    group.add(trunks.build(this.box, this.mats.trunk));
+    const crownMesh = new THREE.InstancedMesh(crownGeo, this.mats.leaves, crowns.length);
+    crowns.forEach(([cx, cy, cz, s], i) => {
+      _m.compose(_p.set(cx, cy, cz), _q.identity(), _s.set(s, s * 1.1, s));
+      crownMesh.setMatrixAt(i, _m);
+    });
+    group.add(crownMesh);
+
+    // call lamps beside each lobby's first lift, indexed like the engine's hall calls
+    const lampGeo = this.track(new THREE.ConeGeometry(0.2, 0.34, 3));
+    lampGeo.rotateY(Math.PI / 6);
+    const lamps = new THREE.InstancedMesh(lampGeo, this.mats.lamp, b.calls.length);
+    const face = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2);
+    const faceDown = face.clone().multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI));
+    _m.makeScale(0, 0, 0);
+    for (let i = 0; i < b.calls.length; i++) lamps.setMatrixAt(i, _m);
+    for (let bank = 0; bank < b.banks; bank++) {
+      const sh = plan.shafts.find((x) => x.bank === bank);
+      if (!sh) continue;
+      const side = sh.doorZ >= 0 ? 1 : -1;
+      for (let f = 0; f < levels; f++) {
+        const i = (bank * levels + f) * 2;
+        const z = sh.doorZ + side * (CAR_W / 2 + 0.55);
+        _m.compose(_p.set(sh.doorX + 0.05, f * ys + 1.7, z), face, _s.set(1, 1, 0.3));
+        lamps.setMatrixAt(i, _m);
+        _m.compose(_p.set(sh.doorX + 0.05, f * ys + 1.25, z), faceDown, _s.set(1, 1, 0.3));
+        lamps.setMatrixAt(i + 1, _m);
+      }
+    }
+    for (let i = 0; i < b.calls.length; i++) lamps.setColorAt(i, _c.setRGB(0.06, 0.08, 0.1));
+    group.add(lamps);
+
+    const highlight = new THREE.Mesh(this.box, this.mats.highlight);
+    highlight.scale.set(plan.length + 1, 1.4, plan.depth + 1);
+    highlight.visible = false;
+    highlight.renderOrder = 3;
+    group.add(highlight);
+
+    const tag = document.createElement('div');
+    tag.className = 'building-tag';
+    tag.textContent = b.cfg.name;
+    const tagObj = new CSS2DObject(tag);
+    tagObj.position.set(0, height + 7, 0);
+    group.add(tagObj);
+
+    return {
+      sim: b,
+      layout: b.layout,
+      offsetX,
+      group,
+      cars,
+      lamps,
+      lampState: new Uint8Array(b.calls.length),
+      windows: lightMesh,
+      windowSeed: Float32Array.from(seeds),
+      windowDay: new THREE.Color(0.62, 0.6, 0.56),
+      windowGain: 0.62,
+      highlight,
+      hostel: plan,
+      yScale,
+      width: plan.length,
+      height,
+      zMin: Math.min(-plan.depth / 2 - 10, plan.street.z - 6),
+      zMax: Math.max(plan.depth / 2 + 10, plan.street.z + 6),
+    };
+  }
+
+  private placeHostelPeople(
+    bv: BuildingVisual,
+    plan: HostelPlan,
+    t: number,
+    start: number,
+    selected: number,
+    color: THREE.Color,
+    mark: (id: number, x: number, y: number, z: number) => void,
+  ): number {
+    const b = bv.sim;
+    const ox = bv.offsetX;
+    const ys = b.h * bv.yScale;
+    let n = start;
+    const jitter = (id: number) => ((id * 2654435761) >>> 0) / 4294967296 - 0.5;
+
+    // waiting: a small cluster in the corridor in front of the lift
+    for (let bank = 0; bank < b.banks; bank++) {
+      const lobby = plan.lobbies[bank];
+      for (let f = 0; f < b.levels; f++) {
+        const ws = b.waiting[bank * b.levels + f];
+        for (let i = 0; i < ws.length; i++) {
+          const p = ws[i];
+          const row = Math.floor(i / 3);
+          const x = lobby.x + ((i % 3) - 1) * 0.62 - 0.15;
+          const z = lobby.z + (row % 2 ? -1 : 1) * Math.ceil(row / 2) * 0.58;
+          const age = t - p.tCall;
+          if (p.id === selected) color.setRGB(1.6, 1.6, 1.6);
+          else if (age < 45) color.setRGB(0.08, 0.62, 0.26).lerp(_c.setRGB(0.9, 0.58, 0.04), age / 45);
+          else color.setRGB(0.9, 0.58, 0.04).lerp(_c.setRGB(0.88, 0.08, 0.08), Math.min(1, (age - 45) / 45));
+          this.placePerson(n, p.id, ox + x, f * ys, z, 1, color);
+          mark(p.id, ox + x, f * ys, z);
+          n++;
+        }
+      }
+    }
+
+    // riding: the car's door faces the corridor, so its local z runs towards -x here
+    for (const c of b.cars) {
+      const sh = plan.shafts[c.index];
+      const cols = Math.max(2, Math.ceil(Math.sqrt(c.cfg.capacity)));
+      const rows = Math.ceil(c.cfg.capacity / cols);
+      const sx = Math.min(0.5, (CAR_W - 0.5) / cols);
+      const sz = Math.min(0.5, (CAR_D - 0.5) / rows);
+      for (const p of c.riders) {
+        let lx = ((p.slot % cols) - (cols - 1) / 2) * sx;
+        let lz = CAR_Z + ((Math.floor(p.slot / cols) % rows) - (rows - 1) / 2) * sz;
+        const k = Math.min(1, (t - p.stateT) / 0.8);
+        if (k < 1) {
+          lx *= k;
+          lz = 0.5 + (lz - 0.5) * k;
+        }
+        const x = sh.doorX - lz;
+        const z = sh.doorZ + lx;
+        const y = c.pos * bv.yScale + 0.12;
+        if (p.id === selected) color.setRGB(1.6, 1.6, 1.6);
+        else color.set(CAR_COLORS[c.index % CAR_COLORS.length]).multiplyScalar(0.8);
+        this.placePerson(n, p.id, ox + x, y, z, 0.95, color);
+        mark(p.id, ox + x, y, z);
+        n++;
+      }
+    }
+
+    // walking the corridors between a room (or the street) and a lobby
+    for (const p of b.walkers) {
+      const k = p.stateDur > 0 ? Math.min(1, Math.max(0, (t - p.stateT) / p.stateDur)) : 1;
+      const coming = p.state === 'walkIn';
+      const room = coming ? p.flat : p.floor === 0 ? -1 : Math.max(0, p.destFlat);
+      let x: number;
+      let z: number;
+      let scale = 1;
+      if (room < -1 && coming && p.fromBank >= 0) {
+        // gave up on a crowded lift and is walking round to another
+        const route = plan.lobbyPath(p.fromBank, p.bank);
+        [x, z] = samplePath(route, k * route.len);
+        x += jitter(p.id) * 0.9;
+        z += jitter(p.id * 13) * 0.9;
+      } else if (room < -1) {
+        const lobby = plan.lobbies[p.bank];
+        x = lobby.x + jitter(p.id) * 1.2;
+        z = lobby.z + jitter(p.id * 7) * 1.6;
+      } else {
+        const route = plan.path(room, p.bank);
+        const u = coming ? 1 - k : k; // 0 at the lift, 1 at the room
+        [x, z] = samplePath(route, (1 - u) * route.len);
+        // keep to one side of the corridor so two-way traffic does not overlap
+        x += jitter(p.id) * 0.9;
+        z += jitter(p.id * 13) * 0.9;
+        scale = Math.min(1, (1 - u) / 0.04 + 0.2);
+      }
+      const y = p.floor * ys + Math.abs(Math.sin(t * 7 + p.id)) * 0.05;
+      if (p.id === selected) color.setRGB(1.6, 1.6, 1.6);
+      else if (coming) color.setRGB(0.2, 0.4, 0.85);
+      else color.setRGB(0.36, 0.38, 0.44);
+      this.placePerson(n, p.id, ox + x, y, z, scale, color);
+      mark(p.id, ox + x, y, z);
+      n++;
+    }
+    return n;
   }
 
   // ------------------------------------------------------------------ camera
 
-  focus(preset: 'overview' | 'lobby' | 'top' | 'side', instant = false) {
+  focus(preset: 'overview' | 'lobby' | 'top' | 'side' | 'plan', instant = false) {
     const { width, height } = this.campus;
     const fov = (this.camera.fov * Math.PI) / 180;
+    const low = this.buildings.some((bv) => bv.hostel); // a wide, low block wants a higher viewpoint
     let pos: THREE.Vector3;
     let target: THREE.Vector3;
-    if (preset === 'lobby') {
+    if (preset === 'plan') {
+      const dist = Math.max(60, (width * 0.62) / this.camera.aspect, low ? 38 : 0) / Math.tan(fov / 2);
+      target = new THREE.Vector3(0, height * 0.5, low ? 3 : 0);
+      pos = new THREE.Vector3(0, height * 0.5 + dist, (low ? 3 : 0) + 0.5);
+    } else if (low && preset === 'overview') {
+      const dist = Math.max(height * 1.25, (width * 0.82) / this.camera.aspect) / Math.tan(fov / 2);
+      target = new THREE.Vector3(0, height * 0.32, 2);
+      pos = new THREE.Vector3(dist * 0.36, dist * 0.6, dist * 0.72);
+    } else if (low && preset === 'lobby') {
+      const front = this.buildings.find((bv) => bv.hostel)!;
+      const door = front.hostel!.entrance;
+      const out = front.hostel!.street.z > door.z ? 1 : -1;
+      target = new THREE.Vector3(front.offsetX + door.x - 5, 2, door.z - out * 8);
+      pos = new THREE.Vector3(front.offsetX + door.x + 12, 10, door.z + out * 27);
+    } else if (preset === 'lobby') {
       target = new THREE.Vector3(0, 2.6, 0);
       pos = new THREE.Vector3(5, 4.2, 30);
     } else if (preset === 'top') {
@@ -630,7 +949,14 @@ export class SceneManager {
   focusFloor(bi: number, floor: number) {
     const bv = this.buildings[bi];
     if (!bv) return;
-    const y = floor * bv.sim.h + 1.5;
+    const y = floor * bv.sim.h * bv.yScale + 1.5;
+    if (bv.hostel) {
+      // look in from the side, through the gap under the floor above
+      const gap = bv.sim.h * bv.yScale;
+      const target = new THREE.Vector3(bv.offsetX, y - 1, 0);
+      this.camGoal = { target, pos: new THREE.Vector3(bv.offsetX + 12, y + Math.max(3, gap * 1.3), bv.hostel.depth / 2 + 30) };
+      return;
+    }
     const target = new THREE.Vector3(bv.offsetX + bv.layout.coreCenter, y, 0);
     this.camGoal = { target, pos: new THREE.Vector3(target.x + 9, y + 7, 40) };
   }
@@ -672,7 +998,7 @@ export class SceneManager {
         }
         o = o.parent;
       }
-      const floor = Math.min(bv.sim.levels - 1, Math.max(0, Math.floor((hit.point.y + 0.2) / bv.sim.h)));
+      const floor = Math.min(bv.sim.levels - 1, Math.max(0, Math.floor((hit.point.y + 0.2) / (bv.sim.h * bv.yScale))));
       this.setSelection({ type: 'floor', b: bv.sim.index, floor });
       return;
     }
@@ -732,9 +1058,9 @@ export class SceneManager {
           const seed = bv.windowSeed[i];
           if (seed < lit) {
             const warm = (seed * 7.3) % 1;
-            _c.setRGB(1.0, 0.76 + 0.16 * warm, 0.42 + 0.35 * warm).multiplyScalar(0.85 + 0.5 * night);
+            _c.setRGB(1.0, 0.76 + 0.16 * warm, 0.42 + 0.35 * warm).multiplyScalar((0.85 + 0.5 * night) * bv.windowGain);
           } else {
-            _c.setRGB(0.03, 0.04, 0.06).lerp(new THREE.Color(0.3, 0.44, 0.6), day);
+            _c.setRGB(0.03, 0.04, 0.06).lerp(bv.windowDay, day);
           }
           bv.windows.setColorAt(i, _c);
         }
@@ -768,6 +1094,10 @@ export class SceneManager {
     };
 
     for (const bv of this.buildings) {
+      if (bv.hostel) {
+        n = this.placeHostelPeople(bv, bv.hostel, t, n, selected, color, mark);
+        continue;
+      }
       const b = bv.sim;
       const l = bv.layout;
       const h = b.h;
@@ -874,26 +1204,27 @@ export class SceneManager {
   private updateBuildings(sim: Simulation) {
     for (const bv of this.buildings) {
       const b = bv.sim;
-      const H = bv.layout.height;
+      const H = bv.height;
       b.cars.forEach((c, i) => {
         const cv = bv.cars[i];
-        cv.group.position.y = c.pos;
+        const carY = c.pos * bv.yScale;
+        cv.group.position.y = carY;
         const slide = (CAR_W / 2) * 0.96 * c.door;
         cv.doorL.position.x = -CAR_W / 4 - slide;
         cv.doorR.position.x = CAR_W / 4 + slide;
-        const top = c.pos + CAR_H + 0.1;
+        const top = carY + CAR_H + 0.1;
         const len = Math.max(0.1, H + 2 - top);
         cv.cable.scale.set(0.07, len, 0.07);
         cv.cable.position.y = top + len / 2;
-        cv.weight.position.y = Math.max(1.4, H - c.pos - 1.4);
+        cv.weight.position.y = Math.max(1.4, H - carY - 1.4);
 
         cv.labelObj.visible = this.showLabels;
         if (this.showLabels) {
           const arrow = c.state === 'moving' ? (c.vel >= 0 ? '▲' : '▼') : c.state === 'idle' ? '' : c.indicator > 0 ? '△' : c.indicator < 0 ? '▽' : '◇';
-          const text = `${carName(c.index)}|${floorLabel(sim.floorOf(b, c))}|${arrow}|${c.riders.length}`;
+          const text = `${c.name}|${floorLabel(sim.floorOf(b, c))}|${arrow}|${c.riders.length}`;
           if (text !== cv.text) {
             cv.text = text;
-            cv.label.innerHTML = `<b>${carName(c.index)}</b><span>${floorLabel(sim.floorOf(b, c))}</span><i>${arrow}</i><em>${c.riders.length}/${c.cfg.capacity}</em>`;
+            cv.label.innerHTML = `<b>${c.name}</b><span>${floorLabel(sim.floorOf(b, c))}</span><i>${arrow}</i><em>${c.riders.length}/${c.cfg.capacity}</em>`;
           }
         }
       });
@@ -915,11 +1246,17 @@ export class SceneManager {
       const sel = this.selection;
       const showFloor = sel?.type === 'floor' && sel.b === b.index;
       bv.highlight.visible = showFloor;
-      if (showFloor) bv.highlight.position.set(0, sel.floor * b.h + (b.h - 0.3) / 2, CORRIDOR_D / 2);
+      if (showFloor && bv.hostel) bv.highlight.position.set(0, sel.floor * b.h * bv.yScale + 0.7, 0);
+      else if (showFloor) bv.highlight.position.set(0, sel.floor * b.h + (b.h - 0.3) / 2, CORRIDOR_D / 2);
       if (sel?.type === 'car' && sel.b === b.index && b.cars[sel.car]) {
         const c = b.cars[sel.car];
         this.marker.visible = true;
-        this.marker.position.set(bv.offsetX + bv.layout.shaftX(sel.car), c.pos + CAR_H + 0.55, CAR_Z + CAR_D / 2);
+        if (bv.hostel) {
+          const sh = bv.hostel.shafts[sel.car];
+          this.marker.position.set(bv.offsetX + sh.doorX, c.pos * bv.yScale + CAR_H + 0.55, sh.doorZ);
+        } else {
+          this.marker.position.set(bv.offsetX + bv.layout.shaftX(sel.car), c.pos + CAR_H + 0.55, CAR_Z + CAR_D / 2);
+        }
       }
     }
   }

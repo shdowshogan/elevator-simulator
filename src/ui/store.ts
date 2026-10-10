@@ -2,9 +2,12 @@ import { create } from 'zustand';
 import type { EditorAlgorithm } from '../algorithms/compile';
 import type { Selection } from '../render/scene';
 import type { SeriesPoint, Summary } from '../sim/metrics';
-import { defaultConfig, type ScenarioConfig, type SimConfig } from '../sim/types';
+import { defaultConfig, hostel18Config, type ScenarioConfig, type SimConfig } from '../sim/types';
 
-export type Tab = 'simulate' | 'sandbox' | 'compare' | 'editor';
+export type Tab = 'simulate' | 'hostel' | 'sandbox' | 'compare' | 'editor';
+/** The tabs that show the 3D view; the simulation keeps running the last one visited. */
+export type LiveTab = 'simulate' | 'hostel' | 'sandbox';
+export const isLive = (t: Tab): t is LiveTab => t === 'simulate' || t === 'hostel' || t === 'sandbox';
 
 export interface Live {
   tick: number;
@@ -84,7 +87,12 @@ interface State {
   algoParams: Record<string, Record<string, number>>;
   editorAlgos: EditorAlgorithm[];
   scenario: ScenarioConfig;
+  hostel: SimConfig; // Hostel 18 has its own settings, separate from the tower
+  hostelSpread: number; // how far apart its floors are drawn
+  hostelRank: CompareRow[];
+  hostelRankRunning: boolean;
   tab: Tab;
+  liveTab: LiveTab;
   playing: boolean;
   speed: number;
   showLabels: boolean;
@@ -97,6 +105,8 @@ interface State {
   sandboxResults: SandboxResult[] | null;
   set: (patch: Partial<State>) => void;
   update: (fn: (cfg: SimConfig) => void) => void;
+  updateHostel: (fn: (cfg: SimConfig) => void) => void;
+  setTab: (tab: Tab) => void;
   updateScenario: (fn: (sc: ScenarioConfig) => void) => void;
   restart: () => void;
 }
@@ -118,8 +128,19 @@ function load(): Partial<State> {
       scenario: null,
     };
     if (!Array.isArray(config.buildings) || !config.buildings.length) config.buildings = base.buildings;
+    const hbase = hostel18Config();
+    const hostel: SimConfig = {
+      ...hbase,
+      ...saved.hostel,
+      traffic: { ...hbase.traffic, ...saved.hostel?.traffic },
+      energy: { ...hbase.energy, ...saved.hostel?.energy },
+      scenario: null,
+    };
+    if (!Array.isArray(hostel.buildings) || hostel.buildings.length !== 1) hostel.buildings = hbase.buildings;
     return {
       config,
+      hostel,
+      hostelSpread: saved.hostelSpread,
       algoId: saved.algoId,
       algoParams: saved.algoParams ?? {},
       editorAlgos: saved.editorAlgos ?? [],
@@ -140,7 +161,12 @@ export const useStore = create<State>((set) => ({
   algoParams: saved.algoParams ?? {},
   editorAlgos: saved.editorAlgos ?? [],
   scenario: saved.scenario ?? structuredClone(SCENARIO_PRESETS[0].scenario),
+  hostel: saved.hostel ?? hostel18Config(),
+  hostelSpread: saved.hostelSpread ?? 1.7,
+  hostelRank: [],
+  hostelRankRunning: false,
   tab: 'simulate',
+  liveTab: 'simulate',
   playing: true,
   speed: saved.speed ?? 20,
   showLabels: saved.showLabels ?? true,
@@ -158,6 +184,13 @@ export const useStore = create<State>((set) => ({
       fn(config);
       return { config };
     }),
+  updateHostel: (fn) =>
+    set((s) => {
+      const hostel = structuredClone(s.hostel);
+      fn(hostel);
+      return { hostel };
+    }),
+  setTab: (tab) => set((s) => ({ tab, liveTab: isLive(tab) ? tab : s.liveTab })),
   updateScenario: (fn) =>
     set((s) => {
       const scenario = structuredClone(s.scenario);
@@ -172,14 +205,14 @@ useStore.subscribe((s, prev) => {
   if (
     s.config === prev.config && s.algoId === prev.algoId && s.algoParams === prev.algoParams &&
     s.editorAlgos === prev.editorAlgos && s.scenario === prev.scenario && s.speed === prev.speed &&
-    s.showLabels === prev.showLabels
+    s.showLabels === prev.showLabels && s.hostel === prev.hostel && s.hostelSpread === prev.hostelSpread
   ) return;
   clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
     try {
       localStorage.setItem(KEY, JSON.stringify({
         config: s.config, algoId: s.algoId, algoParams: s.algoParams, editorAlgos: s.editorAlgos,
-        scenario: s.scenario, speed: s.speed, showLabels: s.showLabels,
+        scenario: s.scenario, speed: s.speed, showLabels: s.showLabels, hostel: s.hostel, hostelSpread: s.hostelSpread,
       }));
     } catch {
       // storage unavailable: settings simply are not remembered
@@ -188,8 +221,9 @@ useStore.subscribe((s, prev) => {
 });
 
 /** The configuration the live simulation actually runs, depending on the open tab. */
-export function effectiveConfig(s: { config: SimConfig; scenario: ScenarioConfig; tab: Tab }): SimConfig {
-  if (s.tab !== 'sandbox') return { ...s.config, scenario: null };
+export function effectiveConfig(s: { config: SimConfig; hostel: SimConfig; scenario: ScenarioConfig; liveTab: LiveTab }): SimConfig {
+  if (s.liveTab === 'hostel') return { ...s.hostel, scenario: null };
+  if (s.liveTab !== 'sandbox') return { ...s.config, scenario: null };
   const base = s.config.buildings[0];
   const elevators = s.scenario.cars.map((_, i) => base.elevators[i] ?? base.elevators[base.elevators.length - 1]);
   return {

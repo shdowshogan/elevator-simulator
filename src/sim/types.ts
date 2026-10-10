@@ -13,6 +13,7 @@ export interface ElevatorConfig {
   served: ServedMode;
   customFloors: string; // e.g. "1-10, 15, 20-30" (only when served === 'custom')
   parkFloor: number; // floor an idle car returns to, -1 = stay where it stopped
+  bank?: number; // which lift lobby the car stands in, for buildings with several (default 0)
 }
 
 export interface BuildingConfig {
@@ -25,6 +26,8 @@ export interface BuildingConfig {
   visitorsMax: number;
   floorHeight: number; // metres
   elevators: ElevatorConfig[];
+  plan?: 'tower' | 'hostel18'; // floor plan; 'tower' when omitted
+  entrance?: number; // hostel18: which junction (0–5, NW…SE) the front door opens onto; default 4 (SW)
 }
 
 export interface TrafficConfig {
@@ -37,6 +40,8 @@ export interface TrafficConfig {
   errandsPerDay: number; // extra round trips per resident per day
   interfloorPerDay: number; // visits to another floor per resident per day
   deliveryShare: number; // share of visitors that are short deliveries
+  profile?: 'residential' | 'hostel'; // daily rhythm; 'residential' when omitted
+  stairsFloors?: number; // trips of this many floors or fewer take the stairs instead (default 0)
 }
 
 export interface EnergyConfig {
@@ -66,6 +71,8 @@ export interface SimConfig {
   traffic: TrafficConfig;
   energy: EnergyConfig;
   scenario: ScenarioConfig | null; // hand-built situation (sandbox), building 0 only
+  /** Buildings with several lift lobbies: walk to the closest, or follow guidance to the fastest. */
+  liftChoice?: 'nearest' | 'guided';
 }
 
 export function defaultElevator(): ElevatorConfig {
@@ -159,3 +166,47 @@ export function servedFloors(e: ElevatorConfig, floors: number): boolean[] {
 export const CAR_COLORS = ['#4cc9f0', '#ff6b9d', '#b5e48c', '#ffd166', '#c77dff', '#ff9f1c', '#06d6a0', '#f4a3a3'];
 export const carName = (i: number) => String.fromCharCode(65 + (i % 26)) + (i >= 26 ? Math.floor(i / 26) : '');
 export const floorLabel = (f: number) => (f === 0 ? 'G' : String(f));
+
+/** IIT Bombay Hostel 18: a figure-8 block with two courtyards and one lift at each of the six junctions. */
+export function hostel18Config(): SimConfig {
+  const c = defaultConfig();
+  c.startHour = 7.5;
+  c.liftChoice = 'nearest';
+  c.buildings = [
+    {
+      name: 'Hostel 18',
+      plan: 'hostel18',
+      floors: 9,
+      flatsPerFloor: 110,
+      residentsMin: 1,
+      residentsMax: 1,
+      visitorsMin: 0,
+      visitorsMax: 1,
+      floorHeight: 3.2,
+      elevators: Array.from({ length: 6 }, (_, bank) => ({
+        capacity: 13,
+        maxSpeed: 1.5,
+        acceleration: 0.8,
+        doorTime: 2.5,
+        boardTime: 1.0,
+        served: 'all' as ServedMode,
+        customFloors: '',
+        parkFloor: -1,
+        bank,
+      })),
+    },
+  ];
+  c.traffic = {
+    ...c.traffic,
+    profile: 'hostel',
+    workShare: 0.85, // students with morning classes
+    workDepartHour: 8.6,
+    workDepartSpread: 0.5,
+    workDurationHours: 4, // back for lunch
+    errandsPerDay: 1.5, // evening and night outings
+    interfloorPerDay: 0.4, // visiting friends on other floors
+    deliveryShare: 0.7,
+    stairsFloors: 1,
+  };
+  return c;
+}

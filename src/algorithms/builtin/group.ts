@@ -52,7 +52,7 @@ export const destinationDispatch: ElevatorAlgorithm = {
     grouping: { label: 'Grouping strength', min: 0, max: 3, step: 0.1, value: 1 },
   },
   assignPassenger(req, world) {
-    const eligible = world.cars.filter((c) => c.serves(req.floor) && c.serves(req.dest)).map((c) => c.id);
+    const eligible = world.cars.filter((c) => c.lobby === req.lobby && c.serves(req.floor) && c.serves(req.dest)).map((c) => c.id);
     return bestCar(eligible, world, (car) => {
       const pickups = car.assigned.map((a) => ({ floor: a.floor, direction: a.direction as number }));
       const pickup = eta(car, req.floor, req.direction, world, pickups);
@@ -87,15 +87,18 @@ export const peakAware: ElevatorAlgorithm = {
   nextStop: (car, world) => collective(car, world),
   park(car, world) {
     const { up, down } = world.traffic;
-    const n = world.cars.length;
+    // cars sharing a lobby spread out between them; a lone car in its lobby decides for itself
+    const group = world.lobbies[car.lobby].cars;
+    const n = group.length;
+    const rank = group.indexOf(car.id);
     const threshold = world.params.sensitivity;
     if (up > threshold && up > 1.5 * down) return 0; // people arriving: wait in the lobby
     if (down > threshold && down > 1.5 * up) {
       // people leaving: spread across the upper floors
-      return nearestServed(car, Math.round((world.topFloor * (car.id + 1)) / (n + 0.5)));
+      return nearestServed(car, Math.round((world.topFloor * (rank + 1)) / (n + 0.5)));
     }
     // quiet or mixed: one car at the lobby, the rest spread evenly
-    return nearestServed(car, Math.round((world.topFloor * car.id) / Math.max(1, n)));
+    return nearestServed(car, Math.round((world.topFloor * rank) / Math.max(1, n)));
   },
 };
 

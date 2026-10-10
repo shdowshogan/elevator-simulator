@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Passenger } from '../sim/engine';
-import { CAR_COLORS, carName, floorLabel } from '../sim/types';
+import { CAR_COLORS, floorLabel } from '../sim/types';
 import { LineChart } from './charts';
 import { FloorSelect, fmtInt, fmtSec, NumInput, Section, Stat } from './components';
 import { runtime } from './runtime';
@@ -13,7 +13,7 @@ const STATE_TEXT: Record<Passenger['state'], string> = {
   walkOut: 'arrived, walking away',
 };
 
-function PersonRow({ p, top }: { p: Passenger; top: number }) {
+function PersonRow({ p, top, lobby }: { p: Passenger; top: number; lobby?: string }) {
   const set = useStore((s) => s.set);
   const sim = runtime.sim;
   return (
@@ -21,6 +21,7 @@ function PersonRow({ p, top }: { p: Passenger; top: number }) {
       <button className="link" onClick={() => set({ selection: { type: 'passenger', id: p.id } })}>#{p.id}</button>
       <span className="muted">to</span>
       <FloorSelect value={p.finalDest} top={top} exclude={p.state === 'riding' ? undefined : p.floor} onChange={(f) => sim.setDestination(p.id, f)} />
+      {lobby && <span className="muted">{lobby}</span>}
       {p.state === 'waiting' && <span className="muted">{fmtSec(sim.time - p.tCall)}</span>}
       <span className="spacer" />
       <button className="ghost" title="Remove this person" onClick={() => sim.removePassenger(p.id)}>✕</button>
@@ -34,6 +35,7 @@ function Inspector() {
   useStore((s) => s.live?.tick); // re-render with the simulation
   const [dest, setDest] = useState(0);
   const [count, setCount] = useState(1);
+  const [lobby, setLobby] = useState(0);
   const sim = runtime.sim;
   if (!selection || !sim) {
     return <p className="note">Click a person, an elevator or a floor in the 3D view to inspect it and change where people want to go.</p>;
@@ -44,7 +46,7 @@ function Inspector() {
     if (!hit) return <p className="note">Person #{selection.id} has left.</p>;
     const { b, p } = hit;
     const top = b.levels - 1;
-    const where = p.state === 'riding' ? `in car ${carName(p.car)}` : `on ${p.floor === 0 ? 'the ground floor' : `floor ${p.floor}`}`;
+    const where = p.state === 'riding' ? `in lift ${b.cars[p.car].name}` : `on ${p.floor === 0 ? 'the ground floor' : `floor ${p.floor}`}`;
     return (
       <div className="inspector">
         <h4>Person #{p.id}<small>{b.cfg.name}</small></h4>
@@ -59,7 +61,8 @@ function Inspector() {
         <div className="kv">
           <span>Waited so far</span><b>{fmtSec(p.waitTotal + (p.state === 'waiting' ? sim.time - p.tCall : 0))}</b>
           <span>Riding time</span><b>{fmtSec(p.rideTotal + (p.state === 'riding' ? sim.time - p.tBoard : 0))}</b>
-          {p.assignedCar >= 0 && <><span>Told to take</span><b>Car {carName(p.assignedCar)}</b></>}
+          {p.assignedCar >= 0 && <><span>Told to take</span><b>Lift {b.cars[p.assignedCar].name}</b></>}
+          {b.banks > 1 && p.state !== 'riding' && <><span>Using the lift at</span><b>{b.plan.bankNames[p.bank]}</b></>}
         </div>
         <div className="chips">
           <button onClick={() => { sim.removePassenger(p.id); set({ selection: null }); }}>Remove person</button>
@@ -78,7 +81,7 @@ function Inspector() {
     const here = sim.floorOf(b, c);
     return (
       <div className="inspector">
-        <h4><i className="dot" style={{ background: CAR_COLORS[c.index % CAR_COLORS.length] }} />Car {carName(c.index)}<small>{b.cfg.name}</small></h4>
+        <h4><i className="dot" style={{ background: CAR_COLORS[c.index % CAR_COLORS.length] }} />Lift {c.name}<small>{b.cfg.name}</small></h4>
         <div className="kv">
           <span>Position</span><b>{floorLabel(here)}{c.state === 'moving' ? ` → ${floorLabel(c.target)}` : ''}</b>
           <span>State</span><b>{c.state}{c.parking ? ' (parking)' : ''}</b>
@@ -99,22 +102,31 @@ function Inspector() {
 
   const f = selection.floor;
   const addDest = dest === f ? (f === 0 ? top : 0) : dest;
+  const here = sim.waitingAt(b, f);
   return (
     <div className="inspector">
       <h4>{f === 0 ? 'Ground floor (lobby)' : `Floor ${f}`}<small>{b.cfg.name}</small></h4>
       <div className="chips">
         <button onClick={() => runtime.scene?.focusFloor(b.index, f)}>Look here</button>
       </div>
-      <h5>Waiting here ({b.waiting[f].length})</h5>
-      {b.waiting[f].length === 0 && <p className="note">Nobody is waiting.</p>}
-      {b.waiting[f].slice(0, 30).map((p) => <PersonRow key={p.id} p={p} top={top} />)}
-      {b.waiting[f].length > 30 && <p className="note">…and {b.waiting[f].length - 30} more.</p>}
+      <h5>Waiting here ({here.length})</h5>
+      {here.length === 0 && <p className="note">Nobody is waiting.</p>}
+      {here.slice(0, 30).map((p) => <PersonRow key={p.id} p={p} top={top} lobby={b.banks > 1 ? b.plan.bankNames[p.bank] : undefined} />)}
+      {here.length > 30 && <p className="note">…and {here.length - 30} more.</p>}
       <div className="add-row">
         <span>Add</span>
         <NumInput value={count} min={1} max={40} integer onChange={setCount} />
         <span>going to</span>
         <FloorSelect value={addDest} top={top} exclude={f} onChange={setDest} />
-        <button onClick={() => { for (let i = 0; i < count; i++) sim.addPassenger(b.index, f, addDest); }}>Add</button>
+        {b.banks > 1 && (
+          <>
+            <span>at</span>
+            <select value={lobby} onChange={(e) => setLobby(Number(e.target.value))}>
+              {b.plan.bankNames.map((name, k) => <option key={k} value={k}>{name} lift</option>)}
+            </select>
+          </>
+        )}
+        <button onClick={() => { for (let i = 0; i < count; i++) sim.addPassenger(b.index, f, addDest, b.banks > 1 ? lobby : undefined); }}>Add</button>
       </div>
     </div>
   );
@@ -138,7 +150,7 @@ function ElevatorBoard() {
             return (
               <button key={c.index} className={`board-row ${selected ? 'on' : ''}`} onClick={() => set({ selection: { type: 'car', b: b.index, car: c.index } })}>
                 <i className="dot" style={{ background: CAR_COLORS[c.index % CAR_COLORS.length] }} />
-                <b>{carName(c.index)}</b>
+                <b>{c.name}</b>
                 <span className="board-floor">{floorLabel(sim.floorOf(b, c))}</span>
                 <span className="board-arrow">{arrow}</span>
                 <span className="meter" title={`${c.riders.length} of ${c.cfg.capacity} people`}>
@@ -169,7 +181,7 @@ export function StatsPanel() {
 
       <div className="stats">
         <Stat label="Average wait" value={s.avgWait.toFixed(1)} unit="s" sub={`95% under ${s.p95Wait.toFixed(0)} s · longest ${s.maxWait.toFixed(0)} s`} hint="From pressing the button to stepping into a car" />
-        <Stat label="Door to door" value={s.avgJourney.toFixed(1)} unit="s" sub={`${s.avgRide.toFixed(1)} s riding · ${s.avgStops.toFixed(1)} stops on the way`} hint="Waiting plus riding" />
+        <Stat label="Door to door" value={s.avgJourney.toFixed(1)} unit="s" sub={`${s.avgRide.toFixed(1)} s riding · ${s.avgTotal.toFixed(0)} s with the walk to and from the lift`} hint="Waiting plus riding. The second figure adds the time spent walking between the room or street and the lift." />
         <Stat label="Electricity" value={s.energyKWh.toFixed(1)} unit="kWh" sub={`${s.whPerTrip.toFixed(0)} Wh per trip · ${s.distanceKm.toFixed(1)} km travelled`} hint="Net of energy fed back by the regenerative drive. It can dip below zero for a moment: an empty car going up is pulled by its heavier counterweight and generates power." />
         <Stat label="Comfort" value={s.comfort.toFixed(0)} unit="/ 100" sub={`cars ${Math.round(s.avgCrowd * 100)}% full · ${s.wrongWayPct.toFixed(1)}% carried the wrong way`} hint="100 minus penalties for crowding (35), stops on the way (30), riding the wrong way first (15), harsh acceleration (10) and long waits (10)" />
       </div>
