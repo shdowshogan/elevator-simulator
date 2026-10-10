@@ -3,7 +3,7 @@ import { listAlgorithms } from '../algorithms/registry';
 import { demandCurve } from '../sim/traffic';
 import {
   CAR_COLORS, carName, defaultBuilding, defaultConfig, defaultElevator, servedFloors,
-  type BuildingConfig, type ElevatorConfig, type ServedMode, type SimConfig,
+  type BuildingConfig, type CallMode, type ElevatorConfig, type ServedMode, type SimConfig,
 } from '../sim/types';
 import { fmtHour, fmtInt, MinMax, Num, NumInput, Section, Seg, Select, Slider, Toggle } from './components';
 import { useStore } from './store';
@@ -20,10 +20,14 @@ const SERVED: { value: ServedMode; label: string }[] = [
 /** Split an elevator bank into zones. Odd counts give the spare car to the first zone. */
 export function applyZoning(elevators: ElevatorConfig[], zoning: 'all' | 'evenodd' | 'lowhigh' | 'mixed'): ElevatorConfig[] {
   const n = elevators.length;
+  const lobbies = elevators.some((e) => e.bank !== undefined);
   return elevators.map((e, i) => {
+    // With several lift lobbies the zones alternate around the building, so both are near every corner.
+    const bank = e.bank ?? 0;
+    const first = lobbies ? ((bank >> 1) + (bank & 1)) % 2 === 0 : i < Math.ceil(n / 2);
     let served: ServedMode = 'all';
-    if (zoning === 'evenodd') served = i < Math.ceil(n / 2) ? 'even' : 'odd';
-    else if (zoning === 'lowhigh') served = i < Math.ceil(n / 2) ? 'low' : 'high';
+    if (zoning === 'evenodd') served = first ? 'even' : 'odd';
+    else if (zoning === 'lowhigh') served = first ? 'low' : 'high';
     else if (zoning === 'mixed') served = i === 0 ? 'even' : i === 1 ? 'odd' : 'all';
     return { ...e, served };
   });
@@ -35,13 +39,13 @@ function uncovered(b: BuildingConfig): number[] {
   return any.flatMap((s, f) => (s ? [] : [f]));
 }
 
-export function AlgorithmPicker() {
+/** Algorithm dropdown with its description and sliders. callMode belongs to whichever building is on screen. */
+export function AlgorithmPicker(props: { callMode: CallMode; onMode: (m: CallMode) => void }) {
   const algoId = useStore((s) => s.algoId);
   const editorAlgos = useStore((s) => s.editorAlgos);
   const algoParams = useStore((s) => s.algoParams);
-  const callMode = useStore((s) => s.config.callMode);
+  const { callMode } = props;
   const set = useStore((s) => s.set);
-  const update = useStore((s) => s.update);
   const entries = useMemo(() => listAlgorithms(editorAlgos), [editorAlgos]);
   const current = entries.find((e) => e.id === algoId) ?? entries[0];
   const algo = current.algo;
@@ -59,7 +63,7 @@ export function AlgorithmPicker() {
       {algo?.prefersMode && algo.prefersMode !== callMode && (
         <p className="warn">
           Designed for {algo.prefersMode === 'destination' ? 'destination keypads' : 'up/down buttons'}.{' '}
-          <button className="link" onClick={() => update((c) => { c.callMode = algo.prefersMode!; })}>Switch</button>
+          <button className="link" onClick={() => props.onMode(algo.prefersMode!)}>Switch</button>
         </p>
       )}
       {Object.entries(algo?.params ?? {}).map(([key, spec]) => (
@@ -78,14 +82,14 @@ export function AlgorithmPicker() {
   );
 }
 
-function ElevatorCard(props: { e: ElevatorConfig; index: number; floors: number; onChange: (fn: (e: ElevatorConfig) => void) => void; onRemove?: () => void; onCopyToAll: () => void }) {
+export function ElevatorCard(props: { e: ElevatorConfig; index: number; floors: number; title?: string; onChange: (fn: (e: ElevatorConfig) => void) => void; onRemove?: () => void; onCopyToAll: () => void }) {
   const { e, index, onChange } = props;
   const served = servedFloors(e, props.floors).filter(Boolean).length;
   return (
     <div className="card">
       <div className="card-head">
         <i className="dot" style={{ background: CAR_COLORS[index % CAR_COLORS.length] }} />
-        <b>Car {carName(index)}</b>
+        <b>{props.title ?? `Car ${carName(index)}`}</b>
         <span className="muted">stops at {served} of {props.floors + 1} levels</span>
         <span className="spacer" />
         <button className="ghost" title="Copy this car's settings to every car" onClick={props.onCopyToAll}>⧉</button>
@@ -216,7 +220,7 @@ export function ConfigPanel() {
       </div>
 
       <Section title="Algorithm">
-        <AlgorithmPicker />
+        <AlgorithmPicker callMode={config.callMode} onMode={(m) => update((c) => { c.callMode = m; })} />
       </Section>
 
       <div className="tabs-row">

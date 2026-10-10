@@ -34,6 +34,8 @@ export function SandboxPanel() {
   const top = useStore((s) => s.config.buildings[0].floors);
   const maxCars = 8;
   const updateScenario = useStore((s) => s.updateScenario);
+  const callMode = useStore((s) => s.config.callMode);
+  const update = useStore((s) => s.update);
   const set = useStore((s) => s.set);
   const restart = useStore((s) => s.restart);
   const results = useStore((s) => s.sandboxResults);
@@ -107,7 +109,7 @@ export function SandboxPanel() {
       </Section>
 
       <Section title="Algorithm">
-        <AlgorithmPicker />
+        <AlgorithmPicker callMode={callMode} onMode={(m) => update((c) => { c.callMode = m; })} />
         <div className="chips">
           <button className="primary" onClick={() => { restart(); setTimeout(() => set({ playing: true }), 30); }}>▶ Run from the start</button>
         </div>

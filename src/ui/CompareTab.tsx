@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { listAlgorithms } from '../algorithms/registry';
 import type { Summary } from '../sim/metrics';
 import { defaultElevator, type SimConfig } from '../sim/types';
-import type { BenchJob, BenchMessage } from '../workers/benchmark.worker';
+import type { BenchJob } from '../workers/benchmark.worker';
+import { runBench } from './bench';
 import { BarChart, Scatter } from './charts';
 import { fmtInt, NumInput, Select } from './components';
 import { applyZoning } from './ConfigPanel';
@@ -36,7 +37,7 @@ function variants(cfg: SimConfig, sweep: Sweep, from: number, to: number): { lab
       for (let k = Math.min(from, to); k <= Math.max(from, to); k++) {
         out.push({
           label: `${k} car${k === 1 ? '' : 's'}`,
-          config: withElevators((b) => Array.from({ length: k }, (_, i) => ({ ...(b.elevators[i] ?? b.elevators[0] ?? defaultElevator()) }))),
+          config: withElevators((b) => Array.from({ length: k }, (_, i) => ({ ...(b.elevators[i] ?? b.elevators[i % Math.max(1, b.elevators.length)] ?? defaultElevator()) }))),
         });
       }
       return out;
@@ -80,7 +81,8 @@ const COLUMNS: { key: string; label: string; hint: string; get: (s: Summary) => 
   { key: 'wait', label: 'Avg wait', hint: 'Seconds from pressing the button to boarding', get: (s) => s.avgWait, digits: 1, better: 'low' },
   { key: 'p95', label: '95% wait', hint: '95% of people waited less than this (s)', get: (s) => s.p95Wait, digits: 0, better: 'low' },
   { key: 'max', label: 'Longest', hint: 'Longest wait (s)', get: (s) => s.maxWait, digits: 0, better: 'low' },
-  { key: 'journey', label: 'Door to door', hint: 'Average wait plus ride (s)', get: (s) => s.avgJourney, digits: 1, better: 'low' },
+  { key: 'journey', label: 'Wait + ride', hint: 'Average wait plus ride (s)', get: (s) => s.avgJourney, digits: 1, better: 'low' },
+  { key: 'total', label: 'With walking', hint: 'Average time from setting off to arriving, including the walk to and from the lift (s)', get: (s) => s.avgTotal, digits: 1, better: 'low' },
   { key: 'long', label: 'Over 60 s', hint: 'Share of people who waited more than a minute (%)', get: (s) => s.longWaitPct, digits: 1, better: 'low' },
   { key: 'kwh', label: 'kWh', hint: 'Electricity for the whole period', get: (s) => s.energyKWh, digits: 1, better: 'low' },
   { key: 'wh', label: 'Wh / trip', hint: 'Electricity per delivered person', get: (s) => s.whPerTrip, digits: 0, better: 'low' },
@@ -91,7 +93,11 @@ const COLUMNS: { key: string; label: string; hint: string; get: (s: Summary) => 
 ];
 
 export function CompareTab() {
-  const config = useStore((s) => s.config);
+  const towers = useStore((s) => s.config);
+  const hostel = useStore((s) => s.hostel);
+  const liveTab = useStore((s) => s.liveTab);
+  const [source, setSource] = useState<'towers' | 'hostel'>(liveTab === 'hostel' ? 'hostel' : 'towers');
+  const config = source === 'hostel' ? hostel : towers;
   const editorAlgos = useStore((s) => s.editorAlgos);
   const algoParams = useStore((s) => s.algoParams);
   const rows = useStore((s) => s.compareRows);
@@ -107,14 +113,13 @@ export function CompareTab() {
   const [seeds, setSeeds] = useState(1);
   const [preferred, setPreferred] = useState(true);
   const [sort, setSort] = useState<{ key: string; dir: 1 | -1 } | null>(null);
-  const workers = useRef<Worker[]>([]);
+  const cancel = useRef<() => void>(() => {});
 
   const stop = () => {
-    workers.current.forEach((w) => w.terminate());
-    workers.current = [];
+    cancel.current();
     set({ compareRunning: false });
   };
-  useEffect(() => () => workers.current.forEach((w) => w.terminate()), []);
+  useEffect(() => () => cancel.current(), []);
 
   const run = () => {
     stop();
@@ -151,37 +156,25 @@ export function CompareTab() {
     if (!jobs.length) return;
     set({ compareRows: table, compareRunning: true });
 
-    let next = 0;
-    let finished = 0;
     const patch = (key: string, change: Partial<CompareRow>) =>
       set({ compareRows: useStore.getState().compareRows.map((r) => (r.key === key ? { ...r, ...change } : r)) });
-    const feed = (w: Worker) => {
-      if (next < jobs.length) w.postMessage(jobs[next++]);
-    };
-    const size = Math.max(1, Math.min(jobs.length, (navigator.hardwareConcurrency || 4) - 1, 6));
-    for (let i = 0; i < size; i++) {
-      const w = new Worker(new URL('../workers/benchmark.worker.ts', import.meta.url), { type: 'module' });
-      workers.current.push(w);
-      w.onmessage = (e: MessageEvent<BenchMessage>) => {
-        const m = e.data;
+    cancel.current = runBench(
+      jobs,
+      (m) => {
         const [id, vi, s] = m.key.split('|');
         const key = `${id}|${vi}`;
         const acc = partial.get(key)!;
         if ('progress' in m) {
           acc.progress[Number(s)] = m.progress;
           patch(key, { progress: acc.progress.reduce((a, c) => a + c, 0) / seeds });
-          return;
-        }
-        if ('error' in m) patch(key, { error: m.error, progress: 1 });
+        } else if ('error' in m) patch(key, { error: m.error, progress: 1 });
         else {
           acc.done.push(m.summary);
           if (acc.done.length === seeds) patch(key, { summary: average(acc.done), progress: 1 });
         }
-        if (++finished === jobs.length) stop();
-        else feed(w);
-      };
-      feed(w);
-    }
+      },
+      () => set({ compareRunning: false }),
+    );
   };
 
   const done = rows.filter((r) => r.summary);
@@ -209,7 +202,17 @@ export function CompareTab() {
     <div className="page">
       <div className="page-side">
         <h2>Compare</h2>
-        <p className="note">Runs every selected algorithm against exactly the same people and trips, without drawing anything, and tabulates the results. It uses the building and traffic settings from the Simulate tab.</p>
+        <p className="note">Runs every selected algorithm against exactly the same people and trips, without drawing anything, and tabulates the results.</p>
+
+        <h4>Building</h4>
+        <Select
+          value={source}
+          onChange={setSource}
+          options={[
+            { value: 'towers', label: 'Towers (settings from the Simulate tab)' },
+            { value: 'hostel', label: 'Hostel 18 (settings from its tab)' },
+          ]}
+        />
 
         <h4>Algorithms</h4>
         <div className="checklist">
@@ -231,7 +234,7 @@ export function CompareTab() {
             <span>cars per building</span>
           </div>
         )}
-        {sweep === 'zoning' && <p className="note">Splits each building's cars in half: one half per zone. Trips between an even and an odd floor then need a change of cars in the lobby.</p>}
+        {sweep === 'zoning' && <p className="note">Splits each building's cars in half: one half per zone (in Hostel 18 the zones alternate around the six lobbies). Trips between an even and an odd floor then need a change of cars on the ground floor.</p>}
 
         <h4>Period</h4>
         <Select value={String(period)} onChange={(v) => setPeriod(Number(v))} options={PERIODS.map((p, i) => ({ value: String(i), label: p.label }))} />

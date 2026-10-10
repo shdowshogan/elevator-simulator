@@ -1,9 +1,11 @@
-import { collective, myCalls, type ElevatorAlgorithm } from '../api';
+import { collective, myCalls, type CarView, type ElevatorAlgorithm } from '../api';
 
 /** Floors another empty car is already heading to, so two cars do not chase the same call. */
-function claimed(carId: number, cars: { id: number; target: number | null; load: number; parking: boolean }[]): Set<number> {
+function claimed(car: CarView, cars: CarView[]): Set<number> {
   const s = new Set<number>();
-  for (const c of cars) if (c.id !== carId && c.target !== null && !c.parking && c.load === 0) s.add(c.target);
+  for (const c of cars) {
+    if (c.id !== car.id && c.lobby === car.lobby && c.target !== null && !c.parking && c.load === 0) s.add(c.target);
+  }
   return s;
 }
 
@@ -15,7 +17,7 @@ export const fcfs: ElevatorAlgorithm = {
   nextStop(car, world) {
     if (car.carCallsInOrder.length) return car.carCallsInOrder[0];
     if (car.isFull) return null;
-    const taken = claimed(car.id, world.cars);
+    const taken = claimed(car, world.cars);
     let oldest = null;
     for (const c of myCalls(car, world)) {
       if (taken.has(c.floor)) continue;
@@ -35,7 +37,7 @@ export const nearest: ElevatorAlgorithm = {
     const from = moving ? car.nextStoppable : car.floor;
     const dir = car.direction;
     const reachable = (f: number) => !moving || (f - from) * dir >= 0;
-    const taken = claimed(car.id, world.cars);
+    const taken = claimed(car, world.cars);
     let best: { floor: number; direction?: 1 | -1 } | null = null;
     let bestDist = Infinity;
     for (const f of car.carCalls) {

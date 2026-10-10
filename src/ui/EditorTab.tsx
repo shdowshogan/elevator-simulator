@@ -34,6 +34,8 @@ export function EditorTab() {
   const editorAlgos = useStore((s) => s.editorAlgos);
   const algoId = useStore((s) => s.algoId);
   const set = useStore((s) => s.set);
+  const setTab = useStore((s) => s.setTab);
+  const liveTab = useStore((s) => s.liveTab);
   const [active, setActive] = useState<string | null>(editorAlgos.find((e) => e.id === algoId)?.id ?? editorAlgos[0]?.id ?? null);
   const current = editorAlgos.find((e) => e.id === active) ?? null;
   const [draft, setDraft] = useState(current?.source ?? '');
@@ -103,7 +105,7 @@ export function EditorTab() {
               <button onClick={remove}>Delete</button>
               <button onClick={() => save(false)} disabled={!dirty}>Save</button>
               <button className="primary" onClick={() => { save(true); }}>Save &amp; run</button>
-              <button onClick={() => set({ tab: 'simulate' })}>Watch in 3D →</button>
+              <button onClick={() => setTab(liveTab)}>Watch in 3D →</button>
             </div>
             {status && <p className={status.ok ? 'ok' : 'warn'}>{status.text}</p>}
             <CodeEditor docKey={current.id} value={current.source} onChange={setDraft} />

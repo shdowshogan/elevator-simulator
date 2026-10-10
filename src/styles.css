@@ -36,7 +36,7 @@ button, input, select { font: inherit; color: inherit; }
 .app { position: relative; height: 100%; }
 .viewport { position: absolute; inset: 0; }
 .viewport canvas { display: block; }
-.label-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.label-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 1; }
 .app.dimmed .label-layer { display: none; }
 .fatal { position: absolute; inset: 0; display: grid; place-items: center; padding: 40px; text-align: center; color: var(--text-2); }
 
@@ -279,4 +279,12 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); tex
 .scatter-key { margin: 6px 0 0; padding-left: 22px; columns: 2; column-gap: 24px; font-size: 11px; color: var(--text-2); }
 .scatter-key li { padding: 1px 0; break-inside: avoid; cursor: default; }
 .scatter-key li.on { color: var(--text); }
+
+
+.lobby-group { display: flex; flex-direction: column; gap: 6px; }
+.lobby-head { display: flex; align-items: center; gap: 8px; padding-top: 4px; border-top: 1px solid var(--line); }
+.mini-table.rank tbody tr { cursor: pointer; }
+.mini-table.rank tbody tr:hover td { background: rgba(255, 255, 255, 0.05); }
+.mini-table.rank tr.current td:first-child { color: var(--accent); font-weight: 600; }
+.mini-table .progress { min-width: 120px; }
 

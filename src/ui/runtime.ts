@@ -42,10 +42,11 @@ export function rebuild() {
   runtime.algo = pickAlgorithm();
   runtime.sim = new Simulation(cfg, runtime.algo, s.algoParams[s.algoId] ?? {});
   acc = 0;
-  const shape = JSON.stringify(cfg.buildings.map((b) => [b.floors, b.flatsPerFloor, b.floorHeight, b.elevators.length]));
+  const shape = JSON.stringify(cfg.buildings.map((b) => [b.plan, b.entrance, b.floors, b.flatsPerFloor, b.floorHeight, b.elevators.map((e) => e.bank ?? 0)]));
+  if (runtime.scene) runtime.scene.hostelSpread = s.hostelSpread;
   runtime.scene?.build(runtime.sim, shape === structure);
   structure = shape;
-  if (s.tab === 'sandbox') useStore.setState({ playing: false, selection: null });
+  if (s.liveTab === 'sandbox') useStore.setState({ playing: false, selection: null });
   else useStore.setState({ selection: null });
   pushLive();
 }
@@ -60,7 +61,7 @@ function pushLive() {
   const pending = sim.pendingCount();
   const s = useStore.getState();
   const done =
-    s.tab === 'sandbox' && pending === 0 && sim.time > 0 &&
+    s.liveTab === 'sandbox' && pending === 0 && sim.time > 0 &&
     sim.buildings.every((b) => b.cars.every((c) => c.state === 'idle'));
   useStore.setState({
     live: {
@@ -112,8 +113,14 @@ export function startRuntime(container: HTMLElement) {
   raf = requestAnimationFrame(frame);
 
   const unsub = useStore.subscribe((s, prev) => {
-    const sandbox = s.tab === 'sandbox';
-    const wasSandbox = prev.tab === 'sandbox';
+    const sandbox = s.liveTab === 'sandbox';
+    const hostel = s.liveTab === 'hostel';
+    const modeChanged = s.liveTab !== prev.liveTab;
+    if (s.hostelSpread !== prev.hostelSpread && runtime.scene) {
+      // only the drawing changes: keep the run going
+      runtime.scene.hostelSpread = s.hostelSpread;
+      if (hostel) runtime.scene.build(runtime.sim, true);
+    }
     if (s.algoParams !== prev.algoParams && s.algoId === prev.algoId) {
       // sliders apply live, without restarting the run
       const next = s.algoParams[s.algoId] ?? {};
@@ -123,10 +130,11 @@ export function startRuntime(container: HTMLElement) {
       s.editorAlgos !== prev.editorAlgos &&
       s.editorAlgos.find((e) => e.id === s.algoId)?.source !== prev.editorAlgos.find((e) => e.id === s.algoId)?.source;
     if (
-      s.config !== prev.config || s.algoId !== prev.algoId || s.revision !== prev.revision ||
-      sandbox !== wasSandbox || (sandbox && s.scenario !== prev.scenario) || editorChanged
+      (!hostel && s.config !== prev.config) || (hostel && s.hostel !== prev.hostel) ||
+      s.algoId !== prev.algoId || s.revision !== prev.revision ||
+      modeChanged || (sandbox && s.scenario !== prev.scenario) || editorChanged
     ) {
-      if (s.revision !== prev.revision || sandbox !== wasSandbox) {
+      if (s.revision !== prev.revision || modeChanged) {
         clearTimeout(rebuildTimer);
         rebuild();
       } else scheduleRebuild();
@@ -148,7 +156,7 @@ export function startRuntime(container: HTMLElement) {
 /** Run the current sandbox situation under every algorithm, headless, and tabulate the results. */
 export function compareSandbox(): SandboxResult[] {
   const s = useStore.getState();
-  const cfg = effectiveConfig({ ...s, tab: 'sandbox' });
+  const cfg = effectiveConfig({ ...s, liveTab: 'sandbox' });
   const out: SandboxResult[] = [];
   for (const entry of listAlgorithms(s.editorAlgos)) {
     if (!entry.algo) continue;

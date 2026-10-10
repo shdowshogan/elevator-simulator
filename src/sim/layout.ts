@@ -48,6 +48,21 @@ export function layoutOf(b: BuildingConfig): Layout {
   };
 }
 
+/** What the engine needs to know about a floor plan: where the lift lobbies are and how far people walk. */
+export interface Plan {
+  kind: 'tower' | 'hostel18';
+  banks: number; // number of separate lift lobbies
+  bankNames: string[];
+  /** Metres between a room (or the street when room is -1) and a lobby. */
+  walk(room: number, bank: number): number;
+  /** Metres between two lobbies on the same floor. */
+  between(a: number, b: number): number;
+}
+
+export function towerPlan(l: Layout): Plan {
+  return { kind: 'tower', banks: 1, bankNames: [''], walk: (room) => walkDistance(l, room), between: () => 0 };
+}
+
 /** Metres walked between a flat door (or the street when flat < 0) and the elevator lobby. */
 export function walkDistance(l: Layout, flat: number): number {
   if (flat < 0) return ENTRANCE_Z - 1;

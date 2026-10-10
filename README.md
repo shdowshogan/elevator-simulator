@@ -15,10 +15,13 @@ Then open http://localhost:5173.
 - `npm test` runs the engine tests (and prints a full-day comparison table).
 - `npm run build` type-checks and builds a production bundle.
 
-## The four tabs
+## The tabs
 
 - **Simulate**: a full day of traffic in your buildings, in 3D. Every setting on the left is editable.
   Click a person, a car or a floor to inspect it and change where people want to go.
+- **Hostel 18**: IIT Bombay Hostel 18 as a figure-8 block with a lift at each of its six junctions,
+  9 floors and about 110 rooms a floor. It has its own settings, a student-day traffic pattern, a
+  choice of how students pick a lift, and a one-click ranking of every algorithm.
 - **Sandbox**: hand-build one exact situation (cars, riders, people waiting) and watch it play out.
 - **Compare**: run several algorithms, or several setups (even/odd zoning, number of cars…), against
   exactly the same people and compare time, electricity and comfort.
@@ -38,7 +41,7 @@ good examples.
 
 ## Where things live
 
-- `src/sim/`: the simulation engine (no graphics; deterministic for a given seed)
+- `src/sim/`: the simulation engine (no graphics; deterministic for a given seed); `hostel.ts` is the Hostel 18 floor plan
 - `src/algorithms/`: the algorithm interface, built-ins and your custom ones
 - `src/render/`: the three.js scene
 - `src/ui/`: the React interface

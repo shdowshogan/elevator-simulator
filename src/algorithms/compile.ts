@@ -17,7 +17,7 @@ export function compileAlgorithm(source: string, id: string): ElevatorAlgorithm 
   const algo = factory(helpers, helpers.UP, helpers.DOWN);
   if (!algo || typeof algo !== 'object') throw new Error('The code must return (or export default) an algorithm object.');
   if (typeof algo.nextStop !== 'function') throw new Error('The algorithm needs a nextStop(car, world) function.');
-  for (const hook of ['assignCall', 'assignPassenger', 'park']) {
+  for (const hook of ['assignCall', 'assignPassenger', 'park', 'chooseLobby']) {
     if (algo[hook] !== undefined && typeof algo[hook] !== 'function') throw new Error(`${hook} must be a function.`);
   }
   for (const [key, spec] of Object.entries(algo.params ?? {}) as [string, any][]) {
@@ -65,6 +65,10 @@ return {
 
   // Where an idle car waits. Return null to stay put.
   // park(car, world) { return 0; },
+
+  // Hostel 18 with "Guided to the fastest": which lift lobby should this person walk to?
+  // req.walk[i] is the walking time in seconds if they use lobby i; req.nearest is their own choice.
+  // chooseLobby(req, world) { return req.nearest; },
 };
 `;
 
@@ -72,7 +76,8 @@ export const EDITOR_REFERENCE: { title: string; rows: [string, string][] }[] = [
   {
     title: 'car',
     rows: [
-      ['id, name', 'index and letter of the car'],
+      ['id, name', 'index and name of the car'],
+      ['lobby', 'which lift lobby it stands in (Hostel 18 has six; a car only answers its own lobby)'],
       ['floor / position', 'nearest floor / exact position in floors'],
       ['direction', '1 up, -1 down, 0 none'],
       ['state', "'idle' | 'moving' | 'opening' | 'open' | 'closing'"],
@@ -90,9 +95,10 @@ export const EDITOR_REFERENCE: { title: string; rows: [string, string][] }[] = [
   {
     title: 'world',
     rows: [
-      ['calls', 'hall calls: floor, direction, age, assignedCar, eligibleCars'],
+      ['calls', 'hall calls: lobby, floor, direction, age, assignedCar, eligibleCars'],
       ['calls[i].waiting / destinations / passengers', 'destination keypads only, otherwise null'],
       ['cars', 'every car in the building'],
+      ['lobbies', 'lift lobbies: { id, name, cars }'],
       ['time, timeOfDay, day', 'seconds since start, hour 0–24, day number'],
       ['traffic', '{ up, down, inter, total } people per minute, last 5 min'],
       ['topFloor, floorHeight, mode', 'building facts'],

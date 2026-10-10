@@ -1,11 +1,13 @@
-import type {
-  CarView,
-  ElevatorAlgorithm,
-  HallCallView,
-  PassengerRequest,
-  WorldView,
+import {
+  eta as estimateArrival,
+  type CarView,
+  type ElevatorAlgorithm,
+  type HallCallView,
+  type PassengerRequest,
+  type WorldView,
 } from '../algorithms/api';
-import { layoutOf, walkDistance, type Layout } from './layout';
+import { layoutOf, type Layout, type Plan } from './layout';
+import { planOf } from './plan';
 import { Metrics, percentile, type SeriesPoint, type Summary } from './metrics';
 import { generateDay, type Trip } from './traffic';
 import { carName, servedFloors, type BuildingConfig, type Dir, type ElevatorConfig, type SimConfig } from './types';
@@ -28,6 +30,8 @@ export interface Passenger {
   flat: number; // where they walk from: flat index, -1 street, -2 already in the lobby
   destFlat: number;
   floor: number; // current floor while not riding
+  bank: number; // the lift lobby they use
+  fromBank: number; // the lobby they gave up on and walked away from, -1 if none
   state: PassengerState;
   stateT: number;
   stateDur: number;
@@ -35,6 +39,7 @@ export interface Passenger {
   lastCar: number;
   slot: number;
   assignedCar: number; // destination keypads: the car they were told to take, -1 = any
+  tStart: number; // when they set off
   tCall: number;
   tBoard: number;
   waitTotal: number;
@@ -47,6 +52,8 @@ export interface Passenger {
 
 export interface Car {
   index: number;
+  name: string;
+  bank: number; // lift lobby this car stands in
   cfg: ElevatorConfig;
   served: boolean[];
   servedList: number[];
@@ -74,6 +81,7 @@ export interface Car {
 }
 
 interface HallCall {
+  bank: number;
   floor: number;
   dir: 1 | -1;
   assignedCar: number;
@@ -84,9 +92,12 @@ export interface BuildingSim {
   index: number;
   cfg: BuildingConfig;
   layout: Layout;
+  plan: Plan;
+  banks: number;
   levels: number;
   h: number;
   cars: Car[];
+  /** Queues, indexed lobby * levels + floor. */
   waiting: Passenger[][];
   walkers: Passenger[];
   passengers: Map<number, Passenger>;
@@ -108,7 +119,8 @@ export interface BuildingSim {
 }
 
 const dirOf = (p: Passenger): 1 | -1 => (p.dest > p.floor ? 1 : -1);
-const callIndex = (floor: number, dir: number) => floor * 2 + (dir === 1 ? 0 : 1);
+/** queue is lobby * levels + floor. */
+const callIndex = (queue: number, dir: number) => queue * 2 + (dir === 1 ? 0 : 1);
 
 export class Simulation {
   readonly cfg: SimConfig;
@@ -132,17 +144,20 @@ export class Simulation {
 
     cfg.buildings.forEach((bc, index) => {
       const levels = bc.floors + 1;
+      const plan = planOf(bc);
       const b: BuildingSim = {
         index,
         cfg: bc,
         layout: layoutOf(bc),
+        plan,
+        banks: plan.banks,
         levels,
         h: bc.floorHeight,
-        cars: bc.elevators.map((ec, i) => this.makeCar(i, ec, bc)),
-        waiting: Array.from({ length: levels }, () => []),
+        cars: bc.elevators.map((ec, i) => this.makeCar(i, ec, bc, plan)),
+        waiting: Array.from({ length: levels * plan.banks }, () => []),
         walkers: [],
         passengers: new Map(),
-        calls: new Array(levels * 2).fill(null),
+        calls: new Array(levels * plan.banks * 2).fill(null),
         version: 1,
         pending: [],
         cursor: 0,
@@ -171,11 +186,17 @@ export class Simulation {
 
   // ------------------------------------------------------------------ setup
 
-  private makeCar(index: number, cfg: ElevatorConfig, bc: BuildingConfig): Car {
+  private makeCar(index: number, cfg: ElevatorConfig, bc: BuildingConfig, plan: Plan): Car {
     const served = servedFloors(cfg, bc.floors);
     const start = cfg.parkFloor >= 0 && cfg.parkFloor <= bc.floors && served[cfg.parkFloor] ? cfg.parkFloor : 0;
+    const bank = Math.min(plan.banks - 1, Math.max(0, Math.round(cfg.bank ?? 0)));
+    // Towers letter their cars; multi-lobby buildings name them after the lobby (NW, NW2, …).
+    const earlier = bc.elevators.slice(0, index).filter((e) => Math.min(plan.banks - 1, Math.max(0, Math.round(e.bank ?? 0))) === bank).length;
+    const name = plan.banks === 1 ? carName(index) : plan.bankNames[bank] + (earlier ? earlier + 1 : '');
     return {
       index,
+      name,
+      bank,
       cfg,
       served,
       servedList: served.flatMap((s, f) => (s ? [f] : [])),
@@ -230,6 +251,8 @@ export class Simulation {
       flat,
       destFlat,
       floor,
+      bank: 0,
+      fromBank: -1,
       state: 'walkIn',
       stateT: this.time,
       stateDur: 0,
@@ -237,6 +260,7 @@ export class Simulation {
       lastCar: -1,
       slot: 0,
       assignedCar: -1,
+      tStart: this.time,
       tCall: this.time,
       tBoard: this.time,
       waitTotal: 0,
@@ -320,7 +344,13 @@ export class Simulation {
     }
     const p = this.newPassenger(b, tr.from, tr.to, tr.flat, tr.destFlat);
     p.dest = leg;
-    p.stateDur = walkDistance(b.layout, tr.flat) / this.cfg.walkSpeed;
+    p.bank = this.chooseBank(b, p, -1);
+    if (p.bank < 0) {
+      b.passengers.delete(p.id);
+      b.unserved++;
+      return;
+    }
+    p.stateDur = b.plan.walk(tr.flat, p.bank) / this.cfg.walkSpeed;
     b.walkers.push(p);
   }
 
@@ -337,35 +367,141 @@ export class Simulation {
     return fromOk && toOk && from !== 0 && to !== 0 ? 0 : -1;
   }
 
+  /**
+   * In a building with several lobbies, someone who arrives to find a crowd bigger than the lift
+   * can take walks on to the nearest lobby with a much shorter queue (once per trip).
+   */
+  private walksOn(b: BuildingSim, p: Passenger): boolean {
+    if (b.banks === 1 || p.fromBank >= 0) return false;
+    const dir = dirOf(p);
+    const queueAt = (k: number) => {
+      let n = 0;
+      for (const q of b.waiting[k * b.levels + p.floor]) if (dirOf(q) === dir) n++;
+      return n;
+    };
+    let room = 0;
+    for (const c of b.cars) if (c.bank === p.bank && c.served[p.floor] && c.served[p.dest]) room += c.cfg.capacity;
+    const queue = queueAt(p.bank);
+    if (queue < room) return false;
+    let alt = -1;
+    let altDist = Infinity;
+    for (let k = 0; k < b.banks; k++) {
+      if (k === p.bank || !b.cars.some((c) => c.bank === k && c.served[p.floor] && c.served[p.dest])) continue;
+      const d = b.plan.between(p.bank, k);
+      if (queueAt(k) * 2 < queue && d < altDist) {
+        alt = k;
+        altDist = d;
+      }
+    }
+    if (alt < 0) return false;
+    p.fromBank = p.bank;
+    p.bank = alt;
+    p.flat = -2;
+    p.state = 'walkIn';
+    p.stateT = this.time;
+    p.stateDur = altDist / this.cfg.walkSpeed;
+    b.walkers.push(p);
+    return true;
+  }
+
   private becomeWaiting(b: BuildingSim, p: Passenger) {
+    if (this.walksOn(b, p)) return;
     p.state = 'waiting';
     p.stateT = this.time;
     p.tCall = this.time;
-    b.waiting[p.floor].push(p);
+    b.waiting[p.bank * b.levels + p.floor].push(p);
     b.recent.push({ t: this.time, kind: p.floor === 0 ? 0 : p.finalDest === 0 ? 1 : 2 });
     this.assignPassenger(b, p);
-    this.refreshCalls(b, p.floor);
+    this.refreshCalls(b, p.bank, p.floor);
     if (this.cfg.callMode === 'destination') b.version++;
+  }
+
+  /**
+   * Which lift lobby a person heads for; -1 if none has a car for the trip. On their own they
+   * take the route with the least walking overall (first lobby they reach on a tie). With
+   * guidance they are sent to the lobby with the best walk-plus-wait.
+   * rom is the lobby they are standing in already, or -1 when starting from a room or the street.
+   */
+  private chooseBank(b: BuildingSim, p: Passenger, from: number): number {
+    const usable = (k: number) => b.cars.some((c) => c.bank === k && c.served[p.floor] && c.served[p.dest]);
+    if (b.banks === 1) return usable(0) ? 0 : -1;
+    const speed = this.cfg.walkSpeed;
+    const farRoom = p.dest === 0 ? -1 : Math.max(0, p.destFlat);
+    const lastLeg = p.dest === p.finalDest;
+    const walk: number[] = [];
+    const near: number[] = [];
+    let best = -1;
+    let bestCost = Infinity;
+    for (let k = 0; k < b.banks; k++) {
+      if (!usable(k)) {
+        walk.push(Infinity);
+        near.push(Infinity);
+        continue;
+      }
+      const here = from >= 0 ? b.plan.between(from, k) : p.flat < -1 ? 0 : b.plan.walk(p.flat, k);
+      const there = lastLeg ? b.plan.walk(farRoom, k) : 0;
+      near.push(here / speed);
+      walk.push((here + there) / speed);
+      const cost = here * 1.001 + there;
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = k;
+      }
+    }
+    if (best < 0 || this.cfg.liftChoice !== 'guided') return best;
+
+    const w = this.worldView(b);
+    const dir = dirOf(p);
+    if (this.algo.chooseLobby) {
+      const req = { floor: p.floor, dest: p.dest, direction: dir, walk, nearest: best };
+      const r = this.safe(b, () => this.algo.chooseLobby!(req, w));
+      if (typeof r === 'number' && Number.isFinite(walk[r])) return r;
+      return best;
+    }
+    // Default guidance: total walking, plus however long the best car there would keep them waiting,
+    // plus a charge for everyone already waiting at or walking to that lobby (which keeps the
+    // lobbies balanced: a far-off lift always looks free by the time you would get there).
+    const heading = new Array<number>(b.banks).fill(0);
+    for (const q of b.walkers) if (q.state === 'walkIn') heading[q.bank]++;
+    for (let i = 0; i < b.waiting.length; i++) heading[Math.floor(i / b.levels)] += b.waiting[i].length;
+    let pick = best;
+    bestCost = Infinity;
+    for (let k = 0; k < b.banks; k++) {
+      if (!Number.isFinite(walk[k])) continue;
+      let arrival = Infinity;
+      for (const c of b.cars) {
+        if (c.bank !== k || !c.served[p.floor] || !c.served[p.dest]) continue;
+        const pending = w.calls.filter((call) => call.eligibleCars.includes(c.index));
+        arrival = Math.min(arrival, estimateArrival(w.cars[c.index], p.floor, dir, w, pending));
+      }
+      const cost = walk[k] + Math.max(0, arrival - near[k]) + 3 * heading[k];
+      if (cost < bestCost) {
+        bestCost = cost;
+        pick = k;
+      }
+    }
+    return pick;
   }
 
   // ------------------------------------------------------------------ hall calls
 
-  private refreshCalls(b: BuildingSim, f: number) {
-    const ws = b.waiting[f];
+  private refreshCalls(b: BuildingSim, bank: number, f: number) {
+    const queue = bank * b.levels + f;
+    const ws = b.waiting[queue];
     for (const dir of [1, -1] as const) {
-      const i = callIndex(f, dir);
+      const i = callIndex(queue, dir);
       const eligible: number[] = [];
       let has = false;
       for (const p of ws) if (dirOf(p) === dir) { has = true; break; }
       if (has) {
         for (const c of b.cars) {
-          if (!c.served[f]) continue;
+          if (c.bank !== bank || !c.served[f]) continue;
           if (ws.some((p) => dirOf(p) === dir && this.mayBoard(c, p))) eligible.push(c.index);
         }
       }
       const cur = b.calls[i];
       if (has && !cur) {
-        const call: HallCall = { floor: f, dir, assignedCar: -1, eligible };
+        const call: HallCall = { bank, floor: f, dir, assignedCar: -1, eligible };
         b.calls[i] = call;
         b.version++;
         this.assignCall(b, call);
@@ -386,7 +522,7 @@ export class Simulation {
   }
 
   private mayBoard(c: Car, p: Passenger): boolean {
-    return c.served[p.dest] && (p.assignedCar < 0 || p.assignedCar === c.index);
+    return c.bank === p.bank && c.served[p.dest] && (p.assignedCar < 0 || p.assignedCar === c.index);
   }
 
   private usesPassengerAssignment(): boolean {
@@ -396,7 +532,7 @@ export class Simulation {
   private assignCall(b: BuildingSim, call: HallCall) {
     if (!this.algo.assignCall || this.usesPassengerAssignment()) return;
     const w = this.worldView(b);
-    const cv = w.calls.find((c) => c.floor === call.floor && c.direction === call.dir);
+    const cv = w.calls.find((c) => c.lobby === call.bank && c.floor === call.floor && c.direction === call.dir);
     if (!cv) return;
     const r = this.safe(b, () => this.algo.assignCall!(cv, w));
     if (typeof r === 'number' && r !== call.assignedCar && call.eligible.includes(r)) {
@@ -416,10 +552,11 @@ export class Simulation {
       direction: dirOf(p),
       age: this.time - p.tCall,
       assignedCar: null,
+      lobby: p.bank,
     };
     const r = this.safe(b, () => this.algo.assignPassenger!(req, w));
     const c = typeof r === 'number' ? b.cars[r] : undefined;
-    if (c && c.served[p.floor] && c.served[p.dest]) p.assignedCar = c.index;
+    if (c && c.bank === p.bank && c.served[p.floor] && c.served[p.dest]) p.assignedCar = c.index;
     b.version++;
   }
 
@@ -552,7 +689,7 @@ export class Simulation {
 
   private hasEligible(b: BuildingSim, c: Car, f: number, d: Dir): boolean {
     if (!d || !c.served[f]) return false;
-    for (const p of b.waiting[f]) if (dirOf(p) === d && this.mayBoard(c, p)) return true;
+    for (const p of b.waiting[c.bank * b.levels + f]) if (dirOf(p) === d && this.mayBoard(c, p)) return true;
     return false;
   }
 
@@ -586,7 +723,7 @@ export class Simulation {
     if (wantsUp && wantsDown) {
       if (c.direction) return c.direction;
       let oldest: Passenger | null = null;
-      for (const p of b.waiting[f]) if (this.mayBoard(c, p) && (!oldest || p.tCall < oldest.tCall)) oldest = p;
+      for (const p of b.waiting[c.bank * b.levels + f]) if (this.mayBoard(c, p) && (!oldest || p.tCall < oldest.tCall)) oldest = p;
       return oldest ? dirOf(oldest) : 1;
     }
     return wantsUp ? 1 : wantsDown ? -1 : 0;
@@ -616,7 +753,7 @@ export class Simulation {
         }
       }
       if (c.indicator !== 0 && c.riders.length < c.cfg.capacity) {
-        for (const p of b.waiting[f]) {
+        for (const p of b.waiting[c.bank * b.levels + f]) {
           if (dirOf(p) === c.indicator && this.mayBoard(c, p)) { boarder = p; break; }
         }
       }
@@ -634,7 +771,7 @@ export class Simulation {
   }
 
   private board(b: BuildingSim, c: Car, p: Passenger, f: number) {
-    const ws = b.waiting[f];
+    const ws = b.waiting[c.bank * b.levels + f];
     ws.splice(ws.indexOf(p), 1);
     let slot = 0;
     while (c.slots[slot]) slot++;
@@ -647,7 +784,7 @@ export class Simulation {
     p.waitTotal += this.time - p.tCall;
     c.riders.push(p);
     if (!c.callOrder.includes(p.dest)) c.callOrder.push(p.dest);
-    this.refreshCalls(b, f);
+    this.refreshCalls(b, c.bank, f);
     b.version++;
   }
 
@@ -663,18 +800,23 @@ export class Simulation {
 
     if (p.finalDest !== f) {
       const leg = this.route(b, f, p.finalDest);
-      if (leg >= 0) {
+      const before = p.dest;
+      if (leg >= 0) p.dest = leg;
+      const bank = leg >= 0 ? this.chooseBank(b, p, c.bank) : -1;
+      if (bank >= 0) {
         // Zoning forced a change of cars: back into the queue for the second ride.
         p.origin = f;
-        p.dest = leg;
         p.flat = -2;
         p.state = 'walkIn';
-        p.stateDur = TRANSFER_WALK;
+        p.stateDur = TRANSFER_WALK + b.plan.between(c.bank, bank) / this.cfg.walkSpeed;
+        p.bank = bank;
         b.walkers.push(p);
         b.metrics.transfers++;
         return;
       }
+      p.dest = before;
     }
+    p.stateDur = b.plan.walk(f === 0 ? -1 : Math.max(0, p.destFlat), c.bank) / this.cfg.walkSpeed;
     b.metrics.record(
       p.waitTotal,
       p.rideTotal,
@@ -682,10 +824,10 @@ export class Simulation {
       p.crowdN ? p.crowdSum / p.crowdN : 0,
       p.wrongWay,
       c.cfg.acceleration,
+      this.time - p.tStart + p.stateDur,
     );
     this.lastDeliveryTime = this.time;
     p.state = 'walkOut';
-    p.stateDur = walkDistance(b.layout, f === 0 ? -1 : Math.max(0, p.destFlat)) / this.cfg.walkSpeed;
     b.walkers.push(p);
   }
 
@@ -703,16 +845,17 @@ export class Simulation {
     // Anyone left behind (car full) needs a new car.
     const d = c.indicator;
     if (!d) return;
-    const call = b.calls[callIndex(f, d)];
+    const queue = c.bank * b.levels + f;
+    const call = b.calls[callIndex(queue, d)];
     if (!call) return;
     if (this.usesPassengerAssignment()) {
-      for (const p of b.waiting[f]) {
+      for (const p of b.waiting[queue]) {
         if (p.assignedCar === c.index && dirOf(p) === d) {
           p.assignedCar = -1;
           this.assignPassenger(b, p);
         }
       }
-      this.refreshCalls(b, f);
+      this.refreshCalls(b, c.bank, f);
     } else if (call.assignedCar === c.index) {
       call.assignedCar = -1;
       this.assignCall(b, call);
@@ -823,7 +966,8 @@ export class Simulation {
       const served = c.served;
       return {
         id: c.index,
-        name: carName(c.index),
+        name: c.name,
+        lobby: c.bank,
         floor: Math.round(c.pos / b.h),
         position: c.pos / b.h,
         velocity: c.vel,
@@ -855,7 +999,7 @@ export class Simulation {
       if (!call) continue;
       let oldest = t;
       const reqs: PassengerRequest[] = [];
-      for (const p of b.waiting[call.floor]) {
+      for (const p of b.waiting[call.bank * b.levels + call.floor]) {
         if (dirOf(p) !== call.dir) continue;
         if (p.tCall < oldest) oldest = p.tCall;
         if (destMode) {
@@ -866,12 +1010,14 @@ export class Simulation {
             direction: call.dir,
             age: t - p.tCall,
             assignedCar: p.assignedCar >= 0 ? p.assignedCar : null,
+            lobby: call.bank,
           };
           reqs.push(req);
           if (p.assignedCar >= 0) cars[p.assignedCar]?.assigned.push(req);
         }
       }
       const v: HallCallView = {
+        lobby: call.bank,
         floor: call.floor,
         direction: call.dir,
         age: t - oldest,
@@ -900,6 +1046,7 @@ export class Simulation {
       mode: this.cfg.callMode,
       cars,
       calls,
+      lobbies: b.plan.bankNames.map((name, id) => ({ id, name, cars: b.cars.filter((c) => c.bank === id).map((c) => c.index) })),
       traffic: {
         up: count[0] / window,
         down: count[1] / window,
@@ -925,15 +1072,29 @@ export class Simulation {
   }
 
   /** Put a new person in the queue on `floor` wanting to go to `dest`. Returns their id, or -1. */
-  addPassenger(bi: number, floor: number, dest: number): number {
+  addPassenger(bi: number, floor: number, dest: number, bank?: number): number {
     const b = this.buildings[bi];
     if (!b || floor === dest || floor < 0 || dest < 0 || floor >= b.levels || dest >= b.levels) return -1;
     const leg = this.route(b, floor, dest);
     if (leg < 0) return -1;
     const p = this.newPassenger(b, floor, dest, -2, dest === 0 ? -1 : 0);
     p.dest = leg;
+    const usable = (k: number) => b.cars.some((c) => c.bank === k && c.served[floor] && c.served[leg]);
+    p.bank = bank !== undefined && usable(bank) ? bank : this.chooseBank(b, p, -1);
+    if (p.bank < 0) {
+      b.passengers.delete(p.id);
+      return -1;
+    }
     this.becomeWaiting(b, p);
     return p.id;
+  }
+
+  /** Everyone waiting on a floor, across all its lift lobbies. */
+  waitingAt(b: BuildingSim, floor: number): Passenger[] {
+    if (b.banks === 1) return b.waiting[floor];
+    const out: Passenger[] = [];
+    for (let k = 0; k < b.banks; k++) for (const p of b.waiting[k * b.levels + floor]) out.push(p);
+    return out;
   }
 
   /** Put a new person inside a car, already heading for `dest`. Returns their id, or -1 if full. */
@@ -976,8 +1137,19 @@ export class Simulation {
     p.destFlat = dest === 0 ? -1 : Math.max(0, p.destFlat);
     if (p.state === 'waiting') {
       p.assignedCar = -1;
+      // If no car in this lobby goes there, they move to one that does.
+      if (!b.cars.some((c) => c.bank === p.bank && c.served[p.floor] && c.served[leg])) {
+        const bank = this.chooseBank(b, p, p.bank);
+        if (bank >= 0 && bank !== p.bank) {
+          const ws = b.waiting[p.bank * b.levels + p.floor];
+          ws.splice(ws.indexOf(p), 1);
+          this.refreshCalls(b, p.bank, p.floor);
+          p.bank = bank;
+          b.waiting[bank * b.levels + p.floor].push(p);
+        }
+      }
       this.assignPassenger(b, p);
-      this.refreshCalls(b, p.floor);
+      this.refreshCalls(b, p.bank, p.floor);
     }
     b.version++;
     return true;
@@ -993,9 +1165,9 @@ export class Simulation {
       c.slots[p.slot] = false;
       this.rebuildCarCalls(c);
     } else if (p.state === 'waiting') {
-      const ws = b.waiting[p.floor];
+      const ws = b.waiting[p.bank * b.levels + p.floor];
       ws.splice(ws.indexOf(p), 1);
-      this.refreshCalls(b, p.floor);
+      this.refreshCalls(b, p.bank, p.floor);
     } else {
       const i = b.walkers.indexOf(p);
       if (i >= 0) b.walkers.splice(i, 1);
@@ -1049,17 +1221,18 @@ export class Simulation {
     const list = bi === undefined ? this.buildings : [this.buildings[bi]];
     const waits: number[] = [];
     const s: Summary = {
-      delivered: 0, avgWait: 0, p95Wait: 0, maxWait: 0, avgRide: 0, avgJourney: 0, longWaitPct: 0,
+      delivered: 0, avgWait: 0, p95Wait: 0, maxWait: 0, avgRide: 0, avgJourney: 0, avgTotal: 0, longWaitPct: 0,
       avgStops: 0, avgCrowd: 0, wrongWayPct: 0, transfers: 0, comfort: 100, energyKWh: 0, whPerTrip: 0,
       starts: 0, doorCycles: 0, distanceKm: 0, utilisation: 0, waitingNow: 0, ridingNow: 0, unserved: 0,
       faults: 0, lastError: null,
     };
+    let total = 0;
     let wait = 0, ride = 0, journey = 0, long = 0, stops = 0, crowd = 0, wrong = 0, comfort = 0, busy = 0, cars = 0;
     for (const b of list) {
       const m = b.metrics;
       for (const w of m.waits) waits.push(w);
       s.delivered += m.delivered;
-      wait += m.waitSum; ride += m.rideSum; journey += m.journeySum; long += m.longWaits;
+      wait += m.waitSum; ride += m.rideSum; journey += m.journeySum; long += m.longWaits; total += m.totalSum;
       stops += m.stopsSum; crowd += m.crowdSum; wrong += m.wrongWay; comfort += m.comfortSum;
       s.transfers += m.transfers;
       s.maxWait = Math.max(s.maxWait, m.maxWait);
@@ -1084,6 +1257,7 @@ export class Simulation {
       s.p95Wait = percentile(waits, 0.95);
       s.avgRide = ride / n;
       s.avgJourney = journey / n;
+      s.avgTotal = total / n;
       s.longWaitPct = (100 * long) / n;
       s.avgStops = stops / n;
       s.avgCrowd = crowd / n;

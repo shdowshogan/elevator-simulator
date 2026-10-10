@@ -5,6 +5,7 @@ export interface Summary {
   maxWait: number;
   avgRide: number;
   avgJourney: number;
+  avgTotal: number; // wait + ride + walking to and from the lift
   longWaitPct: number; // share of people who waited more than 60 s
   avgStops: number; // intermediate stops per ride
   avgCrowd: number; // average car fill while riding, 0–1
@@ -54,6 +55,7 @@ export class Metrics {
   waitSum = 0;
   rideSum = 0;
   journeySum = 0;
+  totalSum = 0;
   maxWait = 0;
   longWaits = 0;
   stopsSum = 0;
@@ -62,7 +64,8 @@ export class Metrics {
   comfortSum = 0;
   transfers = 0;
 
-  record(wait: number, ride: number, stops: number, crowd: number, wrongWay: boolean, accel: number) {
+  record(wait: number, ride: number, stops: number, crowd: number, wrongWay: boolean, accel: number, total: number) {
+    this.totalSum += total;
     this.waits.push(wait);
     this.delivered++;
     this.waitSum += wait;
